@@ -26,9 +26,10 @@ Venus Bot is a simple, yet powerful and customizable Discord music bot built wit
 > **Before You Start:**
 >
 > - ✅ You must have **[FFmpeg](https://ffmpeg.org/download.html)** installed and available in your system’s `PATH`
-> - ✅ You must use **Python 3.11** and create a virtual environment in the root directory
+> - ✅ You must use **Python 3.11 or later** and create a virtual environment in the root directory
 > - ✅ You need to configure the `.env` file before running the bot
 > - ✅ You need to extract your cookies.txt and place it in the root folder.
+> - ✅ For voice channels, install the requirements in a **new** virtual environment. Discord requires the DAVE end-to-end-encryption protocol for non-Stage voice channels; an older `discord.py` or `discord-ext-voice-recv` installation will be rejected (often with voice gateway code `4017`).
 
 ---
 
@@ -36,7 +37,7 @@ Venus Bot is a simple, yet powerful and customizable Discord music bot built wit
 
 ```bash
 # Clone the repository
-git clone https://github.com/VenusMods/VenusBot.git
+git clone https://github.com/Thecatt6/VenusBot.git
 cd VenusBot
 
 # Create and activate a virtual environment
@@ -45,6 +46,15 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
+
+The requirements pin `discord.py` 2.7.1 (which implements DAVE), its `davey` binding, and a reviewed temporary fork of the receive extension that decrypts incoming DAVE audio. The Python import remains `discord.ext.voice_recv`, so no command code needs to change.
+
+You can verify the installed stack before starting the bot:
+
+```bash
+python -m discord --version
+python -c "import davey; from discord.ext import voice_recv; print('DAVE voice stack ready')"
 ```
 ### 🧪 .env Setup
 ```
@@ -184,3 +194,4 @@ Makes the specified user an admin.
 
 ### /removeadmin
 Removes admin from the specified user.
+
