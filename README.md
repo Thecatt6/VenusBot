@@ -77,6 +77,15 @@ OWNER=000000000000000000
 python venusbot.py
 ```
 
+### 🐳 Run with Docker
+
+Keep `.env` and `cookies.txt` beside `docker-compose.yml`; they are mounted at runtime and are not copied into the image. The supplied image includes FFmpeg and Deno, which yt-dlp uses to solve YouTube's JavaScript challenges.
+
+```bash
+docker compose up -d --build
+docker compose logs -f venusbot
+```
+
 ---
 
 ## 🗣️ Voice Related Commands and Info
@@ -194,3 +203,4 @@ Makes the specified user an admin.
 
 ### /removeadmin
 Removes admin from the specified user.
+
