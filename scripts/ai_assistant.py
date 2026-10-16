@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Deque, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -37,6 +37,17 @@ ITALIAN_WEEKDAYS = [
     "venerdì",
     "sabato",
     "domenica",
+]
+
+PREFERRED_GROQ_CHAT_MODELS = [
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
 ]
 
 
@@ -75,32 +86,26 @@ class AIAssistant:
     - Riconosce istantaneamente comandi musicali in italiano e inglese (Fast-Path)
     - Risponde a qualsiasi domanda generale, curiosità, calcolo o richiesta complessa
       usando i migliori provider Cloud AI gratuiti:
-        1. Groq Cloud (Llama 3.3 70B - gratuito e ultra-rapido con GROQ_API_KEY)
-        2. Google Gemini (Gemini 2.0 Flash - gratuito con GEMINI_API_KEY)
+        1. Groq Cloud (rileva automaticamente i modelli attivi sul tuo account Groq)
+        2. Google Gemini (Gemini Flash con GEMINI_API_KEY)
         3. Pollinations Cloud AI (Fallback cloud gratuito zero-config senza API key)
-    - Mantiene memoria conversazionale per ogni server Discord.
     """
 
     def __init__(self):
         load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip().strip("'\"")
         self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip("'\"")
-        self.groq_model = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
+        self.custom_groq_model = (os.getenv("GROQ_MODEL") or "").strip()
         self.gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 
-        # Memoria breve conversazionale per guild_id (ultimi 6 scambi)
+        self._discovered_groq_models: Optional[List[str]] = None
         self._history: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=12))
 
     def clear_history(self, guild_id: int) -> None:
         self._history.pop(guild_id, None)
 
     def _match_fast_command(self, text: str) -> Optional[AssistantResponse]:
-        """
-        Analizza se la frase è un comando diretto ed esplicito (musica, volume, ora/data)
-        per eseguirlo a latenza zero senza attendere chiamate LLM.
-        """
         raw = text.strip()
-        # Rimuovi punteggiatura finale per il matching
         clean = re.sub(r"[.!?]+$", "", raw).strip()
         lower = clean.lower()
 
@@ -212,7 +217,6 @@ class AIAssistant:
             )
 
         # 11. Riproduzione diretta di una canzone specifica
-        # (Se l'utente chiede un consiglio vago come "metti qualcosa di...", lasciamo fare all'AI!)
         m_play = re.match(
             r"^(?:riproduci|metti(?:\s+su)?|suona|fai\s+partire|ascoltiamo|play)\s+(.+)$",
             clean,
@@ -228,7 +232,6 @@ class AIAssistant:
                 "un pezzo ",
             )
             if not any(song_query.lower().startswith(vp) for vp in vague_prefixes):
-                # Rimuovi eventuale "su youtube" / "su spotify" alla fine
                 song_query = re.sub(
                     r"\s+(?:su\s+youtube|su\s+spotify|per\s+favore|per\s+piacere)$",
                     "",
@@ -244,6 +247,64 @@ class AIAssistant:
 
         return None
 
+    async def _get_groq_candidate_models(self, session: aiohttp.ClientSession) -> List[str]:
+        """
+        Interroga l'endpoint /openai/v1/models di Groq per scoprire esattamente quali modelli
+        chat sono abilitati e attivi sull'account dell'utente, evitando qualsiasi errore 404.
+        """
+        if self._discovered_groq_models:
+            return self._discovered_groq_models
+
+        candidates: List[str] = []
+        if self.custom_groq_model:
+            candidates.append(self.custom_groq_model)
+
+        try:
+            headers = {"Authorization": f"Bearer {self.groq_api_key}"}
+            async with session.get("https://api.groq.com/openai/v1/models", headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    available_ids = [
+                        m.get("id", "")
+                        for m in (data.get("data") or [])
+                        if m.get("id")
+                    ]
+                    excluded_keywords = (
+                        "whisper",
+                        "tts",
+                        "playai",
+                        "guard",
+                        "safeguard",
+                        "embed",
+                        "orpheus",
+                        "allam",
+                    )
+                    chat_ids = [
+                        mid
+                        for mid in available_ids
+                        if not any(ex in mid.lower() for ex in excluded_keywords)
+                    ]
+
+                    for pref in PREFERRED_GROQ_CHAT_MODELS:
+                        if pref in chat_ids and pref not in candidates:
+                            candidates.append(pref)
+
+                    for cid in chat_ids:
+                        if cid not in candidates:
+                            candidates.append(cid)
+
+                    if candidates:
+                        self._discovered_groq_models = candidates
+                        logging.info(f"Modelli Groq rilevati: {candidates[:3]}")
+                        return candidates
+        except Exception as e:
+            logging.debug(f"Impossibile elencare i modelli Groq: {e}")
+
+        for pref in PREFERRED_GROQ_CHAT_MODELS:
+            if pref not in candidates:
+                candidates.append(pref)
+        return candidates
+
     async def process_request(
         self,
         guild_id: int,
@@ -252,12 +313,6 @@ class AIAssistant:
         current_song: Optional[str] = None,
         queue_count: int = 0,
     ) -> AssistantResponse:
-        """
-        Elabora la frase dell'utente:
-        1. Prova prima il Fast-Path per comandi diretti immediati
-        2. Altrimenti interroga l'assistente AI Cloud per rispondere a domande o interpretare
-           richieste naturali/musicali in stile Google Assistant.
-        """
         fast = self._match_fast_command(user_text)
         if fast is not None:
             return fast
@@ -290,21 +345,17 @@ class AIAssistant:
 
         raw_reply = None
 
-        # 1. Prova Groq Cloud (se GROQ_API_KEY presente)
         if self.groq_api_key:
             raw_reply = await self._call_groq(messages)
 
-        # 2. Prova Google Gemini Cloud (se GEMINI_API_KEY presente)
         if not raw_reply and self.gemini_api_key:
             raw_reply = await self._call_gemini(system_prompt, history, user_text)
 
-        # 3. Fallback Cloud Gratuito Zero-Config (Pollinations OpenAI-compatible endpoint)
         if not raw_reply:
             raw_reply = await self._call_free_cloud_fallback(messages)
 
         parsed = self._parse_ai_response(raw_reply)
 
-        # Aggiorna la memoria conversazionale
         self._history[guild_id].append({"role": "user", "content": user_text})
         self._history[guild_id].append(
             {"role": "assistant", "content": parsed.voice_reply}
@@ -318,23 +369,33 @@ class AIAssistant:
             "Authorization": f"Bearer {self.groq_api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.groq_model,
-            "messages": messages,
-            "temperature": 0.4,
-            "max_tokens": 300,
-            "response_format": {"type": "json_object"},
-        }
         try:
-            timeout = aiohttp.ClientTimeout(total=8)
+            timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data["choices"][0]["message"]["content"]
-                    else:
-                        err = await resp.text()
-                        logging.warning(f"Groq API status {resp.status}: {err}")
+                models = await self._get_groq_candidate_models(session)
+                for model_name in models[:4]:
+                    payload = {
+                        "model": model_name,
+                        "messages": messages,
+                        "temperature": 0.4,
+                        "max_tokens": 350,
+                    }
+                    async with session.post(url, headers=headers, json=payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            content = data["choices"][0]["message"].get("content") or ""
+                            # Rimuovi eventuali blocchi <think>...</think> di modelli reasoning (es. Qwen)
+                            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                            if content:
+                                return content
+                        elif resp.status == 404:
+                            # Rimuovi il modello non disponibile dalla cache e prova il successivo
+                            if self._discovered_groq_models and model_name in self._discovered_groq_models:
+                                self._discovered_groq_models.remove(model_name)
+                            continue
+                        else:
+                            err = await resp.text()
+                            logging.debug(f"Groq modello {model_name} status {resp.status}: {err}")
         except Exception as e:
             logging.warning(f"Errore chiamata Groq AI: {e}")
         return None
@@ -342,48 +403,44 @@ class AIAssistant:
     async def _call_gemini(
         self, system_prompt: str, history: list, user_text: str
     ) -> Optional[str]:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
-        )
-        contents = []
-        for msg in history:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-        contents.append({"role": "user", "parts": [{"text": user_text}]})
+        for model_name in (self.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={self.gemini_api_key}"
+            )
+            contents = []
+            for msg in history:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+            contents.append({"role": "user", "parts": [{"text": user_text}]})
 
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents,
-            "generationConfig": {
-                "temperature": 0.4,
-                "maxOutputTokens": 300,
-                "responseMimeType": "application/json",
-            },
-        }
-        try:
-            timeout = aiohttp.ClientTimeout(total=8)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            if parts:
-                                return parts[0].get("text")
-                    else:
-                        err = await resp.text()
-                        logging.warning(f"Gemini API status {resp.status}: {err}")
-        except Exception as e:
-            logging.warning(f"Errore chiamata Gemini AI: {e}")
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": 0.4,
+                    "maxOutputTokens": 350,
+                    "responseMimeType": "application/json",
+                },
+            }
+            try:
+                timeout = aiohttp.ClientTimeout(total=8)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                if parts:
+                                    return parts[0].get("text")
+                        elif resp.status == 404:
+                            continue
+            except Exception as e:
+                logging.debug(f"Errore chiamata Gemini ({model_name}): {e}")
         return None
 
     async def _call_free_cloud_fallback(self, messages: list) -> Optional[str]:
-        """
-        Endpoint Cloud AI gratuito senza API key (Pollinations OpenAI-compatible API).
-        Garantisce che il bot possa sempre rispondere alle domande anche senza chiavi nel .env.
-        """
         url = "https://text.pollinations.ai/openai"
         payload = {
             "model": "openai",
@@ -408,11 +465,12 @@ class AIAssistant:
         if not raw_reply:
             return AssistantResponse(
                 action="none",
-                voice_reply="Mi dispiace, al momento non riesco a raggiungere il servizio di intelligenza artificiale.",
+                voice_reply="Mi dispiace, al momento non riesco a elaborare la risposta.",
             )
 
         cleaned = raw_reply.strip()
-        # Estrai eventuale blocco JSON se avvolto in ```json ... ```
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+
         json_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if json_match:
             try:
@@ -431,6 +489,5 @@ class AIAssistant:
             except Exception as e:
                 logging.debug(f"Parsing JSON risposta AI fallito, uso testo diretto: {e}")
 
-        # Se l'AI ha risposto in testo semplice, usalo direttamente come risposta vocale
         plain_text = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL).strip()
         return AssistantResponse(action="none", query="", voice_reply=plain_text)

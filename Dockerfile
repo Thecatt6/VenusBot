@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Installa le dipendenze di sistema necessarie per Discord Voice, FFmpeg, Opus e SpeechRecognition
+# Installa le dipendenze di sistema necessarie per Discord Voice, FFmpeg, Opus, NodeJS (per yt-dlp-ejs) e SpeechRecognition
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libopus0 \
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsodium23 \
     libffi-dev \
     flac \
+    nodejs \
     git \
     ca-certificates \
     tzdata \

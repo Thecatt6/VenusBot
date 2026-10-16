@@ -546,32 +546,51 @@ class ItalianSpeechSink(voice_recv.AudioSink):
     def _recognize_with_groq_whisper(self, audio: sr.AudioData) -> Optional[str]:
         import requests
 
+        if getattr(self, "_groq_whisper_disabled", False):
+            return None
+
+        whisper_models = getattr(
+            self,
+            "_groq_whisper_models",
+            ["whisper-large-v3-turbo", "whisper-large-v3"],
+        )
+
         try:
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {self.groq_api_key}"},
-                files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
-                data={
-                    "model": "whisper-large-v3-turbo",
-                    "language": "it",
-                    "response_format": "json",
-                    "temperature": "0.0",
-                },
-                timeout=6,
-            )
-            if resp.status_code == 200:
-                payload = resp.json()
-                text = (payload.get("text") or "").strip()
-                hallucinations = {
-                    "sottotitoli creati dalla comunità amara.org",
-                    "sottotitoli e revisione a cura di",
-                    "grazie per aver guardato",
-                    "...",
-                }
-                if text.lower() in hallucinations:
-                    return None
-                return text
+            for w_model in list(whisper_models):
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {self.groq_api_key}"},
+                    files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
+                    data={
+                        "model": w_model,
+                        "language": "it",
+                        "response_format": "json",
+                        "temperature": "0.0",
+                    },
+                    timeout=6,
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    text = (payload.get("text") or "").strip()
+                    hallucinations = {
+                        "sottotitoli creati dalla comunità amara.org",
+                        "sottotitoli e revisione a cura di",
+                        "grazie per aver guardato",
+                        "...",
+                    }
+                    if text.lower() in hallucinations:
+                        return None
+                    return text
+                elif resp.status_code in (403, 404):
+                    if w_model in whisper_models:
+                        whisper_models.remove(w_model)
+                    self._groq_whisper_models = whisper_models
+                    if not whisper_models:
+                        self._groq_whisper_disabled = True
+                    continue
+                else:
+                    break
         except Exception as e:
             logging.debug(f"Groq Whisper STT fallback a Google STT: {e}")
         return None

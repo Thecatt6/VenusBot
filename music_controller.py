@@ -35,6 +35,8 @@ class Song:
         duration: int,
         user: discord.User,
         isFile: bool,
+        http_headers: Optional[dict] = None,
+        is_local_cache: bool = False,
     ):
         self.title = title
         self.url = url
@@ -43,6 +45,17 @@ class Song:
         self.duration = duration
         self.user = user
         self.isFile = isFile
+        self.http_headers = http_headers or {}
+        self.is_local_cache = is_local_cache
+
+    def cleanup_cache_file(self) -> None:
+        if self.is_local_cache and self.link:
+            try:
+                p = Path(self.link)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
 
 
 class MusicController:
@@ -69,12 +82,16 @@ class MusicController:
 
         self.current_audio_source: Optional[InterruptibleOpusSource] = None
         self._tts_lock = asyncio.Lock()
-        self._suppress_after_callback: bool = False
 
     def _bot_avatar_url(self) -> Optional[str]:
         if self.client.user:
             return self.client.user.display_avatar.url
         return None
+
+    def _clear_queue_and_cache(self) -> None:
+        for s in self.songQueue:
+            s.cleanup_cache_file()
+        self.songQueue.clear()
 
     def isConnectedToVC(self) -> bool:
         voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
@@ -180,6 +197,7 @@ class MusicController:
 
                 tts_opus = discord.FFmpegOpusAudio(
                     str(tts_file),
+                    before_options="-loglevel error",
                     options='-vn -filter:a "volume=1.15"',
                 )
 
@@ -330,7 +348,7 @@ class MusicController:
             return
         voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
         if not self.isMajorityVote:
-            self.songQueue.clear()
+            self._clear_queue_and_cache()
             self.isLooping = False
             if self.current_audio_source:
                 self.current_audio_source.cancel_interrupt()
@@ -375,7 +393,7 @@ class MusicController:
                 if vote_counts["✅"] >= required_votes:
                     if self.textChannel:
                         await self.textChannel.send("⏹️ Votazione approvata. Fermo la musica e svuoto la coda.")
-                    self.songQueue.clear()
+                    self._clear_queue_and_cache()
                     self.isLooping = False
                     if hasattr(voice_client, "stop_playing"):
                         voice_client.stop_playing()
@@ -397,7 +415,7 @@ class MusicController:
     async def softDisconnect(self):
         if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self.songQueue.clear()
+            self._clear_queue_and_cache()
             self.isLooping = False
             self.current_audio_source = None
             await voice_client.disconnect(force=False)
@@ -406,7 +424,7 @@ class MusicController:
     async def hardDisconnect(self):
         if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self.songQueue.clear()
+            self._clear_queue_and_cache()
             self.isLooping = False
             self.current_audio_source = None
             await voice_client.disconnect(force=True)
@@ -449,13 +467,6 @@ class MusicController:
             logging.exception(f"Errore avvio ascolto vocale: {e}")
 
     async def handleTranscribedAudio(self, user: discord.Member, text: str):
-        """
-        Gestisce l'audio trascritto in italiano:
-        1. Invia al canale di trascrizione (se attivo)
-        2. Aggiorna eventuali contatori di parole (/counters)
-        3. Verifica se è stata pronunciata la parola di attivazione (wake word)
-        4. Elabora la richiesta (musica o domanda stile Google Assistant) e risponde a voce!
-        """
         if not text or not text.strip():
             return
 
@@ -467,7 +478,6 @@ class MusicController:
             except Exception as e:
                 logging.debug(f"Errore invio trascrizione: {e}")
 
-        # Controlla contatori parole (/counters)
         word_counters_data = await WordCounter().loadWordCounters()
         keywords_map = word_counters_data[0] if word_counters_data else {}
         text_lower = text.lower()
@@ -477,13 +487,11 @@ class MusicController:
         ):
             await self.handle_word_counter_keyword(user, text_lower)
 
-        # Verifica la parola di attivazione (wake word) con tolleranza fonetica italiana
         kw_manager = BotKeywords()
         activated, matched_wake, remainder = await kw_manager.extractCommandAfterWakeWord(text)
         if not activated:
             return
 
-        # Controlla se l'utente è bannato
         banned_ids = await BannedUsers().loadBannedUserIDs()
         if user.id in banned_ids:
             await self.speakInVC(f"Mi dispiace {user.display_name}, non sei autorizzato a usare i comandi.")
@@ -507,7 +515,6 @@ class MusicController:
         await self.executeAssistantResponse(user, assistant_resp)
 
     async def executeAssistantResponse(self, user: discord.Member, resp):
-        """Esegue l'azione decisa dall'assistente e parla nel canale vocale (Solo Voce)."""
         action = resp.action
         query = resp.query
         voice_reply = resp.voice_reply
@@ -532,7 +539,6 @@ class MusicController:
                 await self.resumeSong()
                 return
 
-            # Pronuncia la risposta vocale mentre cerca e accoda il brano
             speak_task = asyncio.create_task(
                 self.speakInVC(voice_reply or f"Riproduco {query}.")
             )
@@ -600,7 +606,6 @@ class MusicController:
             await self.hardDisconnect()
             return
 
-        # Qualsiasi altra risposta
         if voice_reply:
             await self.speakInVC(voice_reply)
 
@@ -624,6 +629,19 @@ class MusicController:
                         if self._bot_avatar_url():
                             embed.set_thumbnail(url=self._bot_avatar_url())
                         await self.textChannel.send(embed=embed)
+
+    def _build_song_from_result(self, result: dict, user: discord.User, fallback_url: Optional[str] = None) -> Song:
+        return Song(
+            title=result["title"],
+            url=result.get("url") or fallback_url or result["link"],
+            link=result["link"],
+            thumbnail=result.get("thumbnail") or self._bot_avatar_url(),
+            duration=result.get("duration", 0),
+            user=user,
+            isFile=False,
+            http_headers=result.get("http_headers"),
+            is_local_cache=bool(result.get("is_local_cache")),
+        )
 
     async def handleFile(self, user: discord.User, file: discord.Attachment):
         fileSong = Song(
@@ -681,15 +699,7 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Brano non trovato.")
             return
-        youtubeSong = Song(
-            result["title"],
-            url,
-            result["link"],
-            result["thumbnail"] or self._bot_avatar_url(),
-            result["duration"],
-            user,
-            isFile=False,
-        )
+        youtubeSong = self._build_song_from_result(result, user, fallback_url=url)
         await self.queueSong(youtubeSong)
 
     async def handleYoutubePlaylist(self, user, url):
@@ -714,15 +724,7 @@ class MusicController:
                 songInfo = await searcher.getVideoInfoFromURL(song["url"])
                 if not songInfo:
                     continue
-                youtubeSong = Song(
-                    songInfo["title"],
-                    song["url"],
-                    songInfo["link"],
-                    songInfo["thumbnail"] or self._bot_avatar_url(),
-                    songInfo["duration"],
-                    user,
-                    isFile=False,
-                )
+                youtubeSong = self._build_song_from_result(songInfo, user, fallback_url=song["url"])
                 await self.queueSong(youtubeSong)
             except Exception as e:
                 logging.error(e)
@@ -751,15 +753,7 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Brano non trovato.")
             return
-        youtubeSong = Song(
-            result["title"],
-            result["url"],
-            result["link"],
-            result["thumbnail"] or self._bot_avatar_url(),
-            result["duration"],
-            user,
-            isFile=False,
-        )
+        youtubeSong = self._build_song_from_result(result, user)
         await self.queueSong(youtubeSong)
 
     async def handleSpotifyPlaylist(self, user, playlist):
@@ -790,15 +784,7 @@ class MusicController:
                 songInfo = await searcher.getVideoInfoFromQuery(query)
                 if not songInfo:
                     continue
-                youtubeSong = Song(
-                    songInfo["title"],
-                    songInfo["url"],
-                    songInfo["link"],
-                    songInfo["thumbnail"] or self._bot_avatar_url(),
-                    songInfo["duration"],
-                    user,
-                    isFile=False,
-                )
+                youtubeSong = self._build_song_from_result(songInfo, user)
                 await self.queueSong(youtubeSong)
             except Exception as e:
                 logging.error(e)
@@ -817,15 +803,7 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Brano SoundCloud non trovato.")
             return
-        soundcloudSong = Song(
-            result["title"],
-            url,
-            result["link"],
-            result["thumbnail"] or self._bot_avatar_url(),
-            result["duration"],
-            user,
-            isFile=False,
-        )
+        soundcloudSong = self._build_song_from_result(result, user, fallback_url=url)
         await self.queueSong(soundcloudSong)
 
     async def handleSoundCloudPlaylist(self, user, url):
@@ -850,15 +828,7 @@ class MusicController:
                 songInfo = await searcher.getVideoInfoFromURL(song["url"])
                 if not songInfo:
                     continue
-                soundcloudSong = Song(
-                    songInfo["title"],
-                    song["url"],
-                    songInfo["link"],
-                    songInfo["thumbnail"] or self._bot_avatar_url(),
-                    songInfo["duration"],
-                    user,
-                    isFile=False,
-                )
+                soundcloudSong = self._build_song_from_result(songInfo, user, fallback_url=song["url"])
                 await self.queueSong(soundcloudSong)
             except Exception as e:
                 logging.error(e)
@@ -877,15 +847,7 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Nessun brano trovato.")
             return
-        youtubeSong = Song(
-            result["title"],
-            result["url"],
-            result["link"],
-            result["thumbnail"] or self._bot_avatar_url(),
-            result["duration"],
-            user,
-            isFile=False,
-        )
+        youtubeSong = self._build_song_from_result(result, user)
         await self.queueSong(youtubeSong)
 
     async def queueSong(self, song: Song):
@@ -904,6 +866,27 @@ class MusicController:
                     embed.set_thumbnail(url=song.thumbnail)
                 await self.textChannel.send(embed=embed)
 
+    @staticmethod
+    def _build_ffmpeg_before_options(song: Song) -> str:
+        """
+        Costruisce le opzioni FFmpeg:
+        - Se il file è già scaricato in cache locale da yt-dlp, non servono opzioni di rete.
+        - Se è uno stream HTTP (live radio o file remoto), passa User-Agent e Headers di yt-dlp
+          per evitare errori HTTP 403 Forbidden.
+        """
+        if song.is_local_cache and Path(song.link).exists():
+            return "-loglevel error"
+
+        parts = ["-loglevel error"]
+        headers = song.http_headers or {}
+        user_agent = headers.get("User-Agent") or headers.get("user-agent")
+        if user_agent:
+            safe_ua = str(user_agent).replace('"', '\\"')
+            parts.append(f'-user_agent "{safe_ua}"')
+
+        parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+        return " ".join(parts)
+
     async def playSong(self):
         if not self.songQueue:
             self.current_audio_source = None
@@ -920,28 +903,38 @@ class MusicController:
         if not self.songQueue:
             return
 
-        ffmpeg_options = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": f'-vn -filter:a "volume={self.volume:.2f}"',
-        }
-
         song = self.songQueue[0]
 
         if not song.isFile:
-            exp = getSongExpiration(song.link)
-            if exp is not None and exp <= int(time.time()):
-                logging.debug("Stream URL scaduto, rigenero il link...")
+            # Se era un file locale che è stato rimosso o uno stream URL scaduto, rigeneralo
+            needs_refresh = False
+            if song.is_local_cache and not Path(song.link).exists():
+                needs_refresh = True
+            elif not song.is_local_cache:
+                exp = getSongExpiration(song.link)
+                if exp is not None and exp <= int(time.time()):
+                    needs_refresh = True
+
+            if needs_refresh:
+                logging.debug("Rigenerazione risorsa audio per il brano...")
                 searcher = VideoSearcher()
                 try:
                     result = await searcher.getVideoInfoFromURL(song.url)
                     if result and result.get("link"):
                         song.link = result["link"]
+                        song.http_headers = result.get("http_headers") or {}
+                        song.is_local_cache = bool(result.get("is_local_cache"))
                 except Exception as e:
-                    logging.error(f"Errore aggiornamento URL scaduto: {e}")
+                    logging.error(f"Errore aggiornamento brano: {e}")
                     if self.textChannel:
                         await self.textChannel.send(f"❌ Impossibile riprodurre il brano: {e}")
                     self.songQueue.pop(0)
                     return await self.playSong()
+
+        ffmpeg_options = {
+            "before_options": self._build_ffmpeg_before_options(song),
+            "options": f'-vn -filter:a "volume={self.volume:.2f}"',
+        }
 
         raw_player = discord.FFmpegOpusAudio(song.link, **ffmpeg_options)
         interruptible_player = InterruptibleOpusSource(raw_player)
@@ -951,7 +944,8 @@ class MusicController:
             if error:
                 logging.error(f"Errore durante la riproduzione: {error}")
             if not self.isLooping and self.songQueue:
-                self.songQueue.pop(0)
+                finished_song = self.songQueue.pop(0)
+                finished_song.cleanup_cache_file()
             fut = asyncio.run_coroutine_threadsafe(self.playSong(), self.client.loop)
             fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
 
