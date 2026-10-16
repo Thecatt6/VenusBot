@@ -830,11 +830,14 @@ class MusicController:
         if not text or not text.strip():
             return
 
-        logging.info(f"[Voce] {user.display_name}: {text}")
+        clean_display_text = re.sub(r"\s*\[EN_HINT:\s*.+?\]$", "", text, flags=re.IGNORECASE).strip()
+        logging.info(f"[Voce] {user.display_name}: {clean_display_text}")
 
         if self.transcriptionChannel:
             try:
-                await self.transcriptionChannel.send(f"🗣️ **{user.display_name}**: {text}")
+                await self.transcriptionChannel.send(
+                    f"🗣️ **{user.display_name}**: {clean_display_text}"
+                )
             except Exception as e:
                 logging.debug(f"Errore invio trascrizione: {e}")
 

@@ -532,22 +532,24 @@ class ItalianDiscordAudioSource(sr.AudioSource):
 
 class ItalianSpeechSink(voice_recv.AudioSink):
     """
-    Sink vocale Discord con raccoglitore di frasi (Utterance Collector) per-utente:
-    - Accumula i pacchetti PCM di ciascun utente finché l'utente non fa una vera pausa
-      di fine frase (1.15 secondi di silenzio), evitando di spezzare "Venus... metti [canzone]"
-      in due tronconi separati!
-    - Usa Groq Whisper Large v3 Turbo con prompt bilingue (Italiano + titoli canzoni Inglesi)
-      e Google Speech Recognition (it-IT + supporto en-US per i titoli) in fallback.
+    Sink vocale Discord Multi-Motore ad Alta Precisione (Utterance Collector):
+    - Ricostruisce le micro-pause DTX di Discord tra una parola e l'altra (evitando che
+      "Venus" e "metti" vengano incollati senza spazio audio).
+    - Normalizza il volume sui PICCHI reali (Peak Normalization a ~73% full-scale)
+      senza MAI clippare o distorcere la voce.
+    - Supporta 4 motori Speech-to-Text combinati:
+      1. Deepgram Nova-3 (se DEEPGRAM_API_KEY è presente: bilingue nativo IT+EN ultra-preciso)
+      2. Google Gemini 2.0 Flash Audio (se GEMINI_API_KEY è presente: comprensione audio nativa di titoli e artisti)
+      3. Groq Whisper Large v3 (32-layer full model + doppio passaggio IT + EN/Multilingua per le canzoni)
+      4. Google Speech Recognition Multi-Alternativa (top-5 ipotesi it-IT + ipotesi en-US in parallelo)
     """
 
     SAMPLE_RATE = 48_000
     SAMPLE_WIDTH = 2
-    SHORT_SILENCE_FLUSH_SECONDS = 0.55  # Per attivazione rapida ("Venus")
-    LONG_SILENCE_FLUSH_SECONDS = 0.88   # Per frasi con titolo canzone ("Venus metti ...")
+    SHORT_SILENCE_FLUSH_SECONDS = 0.58  # Per attivazione rapida ("Venus")
+    LONG_SILENCE_FLUSH_SECONDS = 0.92   # Per frasi con titolo canzone ("Venus metti ...")
     MAX_PHRASE_SECONDS = 10.0           # Durata massima singola frase
-    _HTTP_SESSION = requests.Session()
-    _GROQ_WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
-    _GROQ_WHISPER_DISABLED = False
+    _GROQ_WHISPER_MODELS = ["whisper-large-v3", "whisper-large-v3-turbo"]
 
     def __init__(
         self,
@@ -556,14 +558,17 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         language: str = "it-IT",
     ):
         super().__init__(None)
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
         self.on_transcription = on_transcription
         self.phrase_time_limit = phrase_time_limit
         self.language = language
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip().strip("'\"")
+        self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip("'\"")
+        self.deepgram_api_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip().strip("'\"")
 
         self._lock = threading.Lock()
         self._user_buffers: Dict[int, Dict[str, Any]] = {}
-        self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=12))
+        self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
         self._recognizer = sr.Recognizer()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-worker")
         self._running = True
@@ -597,7 +602,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         with self._lock:
             entry = self._user_buffers.get(user.id)
             if entry is None:
-                # Conserva sempre gli ultimi ~240ms di pre-roll per non tagliare mai l'inizio della prima parola
+                # Conserva sempre gli ultimi ~300ms di pre-roll per non tagliare mai l'inizio della prima parola
                 self._preroll_buffers[user.id].append(mono_pcm)
                 if rms < 85:
                     return
@@ -608,10 +613,19 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     "pcm": bytearray(preroll_bytes),
                     "first_ts": now,
                     "last_ts": now,
+                    "last_pkt_ts": now,
                 }
                 self._user_buffers[user.id] = entry
             else:
                 entry["user"] = user
+                # Se Discord ha sospeso l'invio di pacchetti RTP durante una breve pausa tra due parole
+                # (es. "Venus ... metti"), reinserisci i millisecondi di silenzio mancanti così le parole
+                # non vengono incollate tra loro!
+                pkt_gap = now - entry.get("last_pkt_ts", now)
+                if 0.06 <= pkt_gap <= 0.65:
+                    gap_samples = int(min(pkt_gap, 0.35) * self.SAMPLE_RATE)
+                    entry["pcm"].extend(b"\x00" * (gap_samples * self.SAMPLE_WIDTH))
+                entry["last_pkt_ts"] = now
                 entry["pcm"].extend(mono_pcm)
                 if rms >= 80:
                     entry["last_ts"] = now
@@ -626,12 +640,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 for uid, entry in list(self._user_buffers.items()):
                     silence_elapsed = now - entry["last_ts"]
                     total_elapsed = now - entry["first_ts"]
-                    # Se la frase è breve (< 0.9s, es. solo "Venus"), chiudi a 0.55s per dare subito il beep!
-                    # Se l'utente sta pronunciando una frase più lunga ("Venus metti ..."), attendi 0.88s
-                    # così una breve esitazione prima del titolo della canzone non spezza il comando.
                     threshold = (
                         self.SHORT_SILENCE_FLUSH_SECONDS
-                        if total_elapsed < 0.90
+                        if total_elapsed < 0.85
                         else self.LONG_SILENCE_FLUSH_SECONDS
                     )
                     if (
@@ -647,23 +658,24 @@ class ItalianSpeechSink(voice_recv.AudioSink):
     def _process_utterance(self, user: discord.Member, pcm_bytes: bytes) -> None:
         try:
             duration_sec = len(pcm_bytes) / (self.SAMPLE_RATE * self.SAMPLE_WIDTH)
-            if duration_sec < 0.30:
+            if duration_sec < 0.28:
                 return
             rms = audioop.rms(pcm_bytes, self.SAMPLE_WIDTH)
-            if rms < 95:
+            peak = audioop.max(pcm_bytes, self.SAMPLE_WIDTH)
+            if rms < 75 or peak < 350:
                 return
 
-            # Normalizzazione automatica del guadagno microfono (AGC) se il volume della voce è basso
-            if rms < 2600:
-                gain = min(3.8, 3000.0 / max(rms, 1))
+            # Normalizzazione sul PICCO REALE (Peak Normalization a 23000 / 32767 = ~70% full-scale):
+            # amplifica i microfoni bassi ma impedisce MATEMATICAMENTE qualsiasi clipping o distorsione!
+            if 400 <= peak < 19000:
+                gain = min(2.4, 23000.0 / float(peak))
                 try:
                     pcm_bytes = audioop.mul(pcm_bytes, self.SAMPLE_WIDTH, gain)
                 except Exception:
                     pass
 
-            # Aggiungi 180ms di silenzio pulito all'inizio e alla fine per migliorare drasticamente
-            # l'accuratezza di Whisper e Google STT sulle parole iniziali e finali
-            pad = b"\x00" * int(self.SAMPLE_RATE * self.SAMPLE_WIDTH * 0.18)
+            # Aggiungi 200ms di silenzio pulito all'inizio e alla fine
+            pad = b"\x00" * int(self.SAMPLE_RATE * self.SAMPLE_WIDTH * 0.20)
             framed_pcm = pad + pcm_bytes + pad
 
             audio = sr.AudioData(framed_pcm, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
@@ -673,46 +685,116 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         except Exception as e:
             logging.debug(f"Errore elaborazione frase vocale: {e}")
 
-    def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
-        # 1. Prova Groq Whisper Cloud multilingue (capisce nativamente comandi italiani + titoli inglesi)
-        if self.groq_api_key:
-            whisper_text = self._recognize_with_groq_whisper(audio)
-            if whisper_text:
-                return whisper_text
+    @staticmethod
+    def _looks_like_music_request(text: str) -> bool:
+        t = text.lower()
+        return any(
+            w in t
+            for w in (
+                "metti",
+                "mettere",
+                "riproduci",
+                "riprodurre",
+                "suona",
+                "suonare",
+                "play",
+                "cerca",
+                "ascoltiamo",
+                "fammi ascoltare",
+                "voglio ascoltare",
+                "canzone",
+                "brano",
+            )
+        )
 
-        # 2. Fallback Google Speech Recognition (it-IT + doppia ipotesi en-US per i titoli inglesi)
+    def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
+        wav_bytes: Optional[bytes] = None
+        try:
+            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+        except Exception:
+            wav_bytes = None
+
+        # 1. Deepgram Nova-3 (se DEEPGRAM_API_KEY è impostata: modello bilingue nativo IT+EN)
+        if self.deepgram_api_key and wav_bytes:
+            dg_text = self._recognize_with_deepgram(wav_bytes)
+            if dg_text:
+                logging.info(f"[STT: Deepgram Nova-3] '{dg_text}'")
+                return dg_text
+
+        # 2. Google Gemini 2.0 Flash Multimodal Audio (se GEMINI_API_KEY è impostata: ascolto nativo)
+        if self.gemini_api_key and wav_bytes:
+            gem_text = self._recognize_with_gemini_audio(wav_bytes)
+            if gem_text:
+                logging.info(f"[STT: Gemini Audio] '{gem_text}'")
+                return gem_text
+
+        # 3. Groq Whisper Large v3 (modello completo a 32 layer) + arricchimento bilingue parallelo per le canzoni
+        if self.groq_api_key and wav_bytes:
+            whisper_it = self._recognize_with_groq_whisper(wav_bytes, language="it")
+            if whisper_it:
+                if self._looks_like_music_request(whisper_it):
+                    # Per le richieste di canzoni, esegui anche la trascrizione multilingue/inglese
+                    # così i titoli inglesi ("Blinding Lights", "Bohemian Rhapsody", ecc.) sono perfetti!
+                    en_hint = self._recognize_with_groq_whisper(wav_bytes, language=None)
+                    if not en_hint:
+                        en_hint = self._recognize_google_en(recognizer, audio)
+                    if en_hint and en_hint.lower().strip() != whisper_it.lower().strip():
+                        logging.info(
+                            f"[STT: Groq Whisper-v3 Dual] IT='{whisper_it}' | EN='{en_hint}'"
+                        )
+                        return f"{whisper_it} [EN_HINT: {en_hint}]"
+                logging.info(f"[STT: Groq Whisper-v3] '{whisper_it}'")
+                return whisper_it
+
+        # 4. Google Speech Recognition Multi-Alternativa (it-IT top-5 + en-US)
         try:
             func = getattr(recognizer, "recognize_google", None)
             if func:
                 raw_it = func(audio, language=self.language, show_all=True)
                 best_it = None
-                alt_it = []
+                alt_it: list[str] = []
                 if isinstance(raw_it, dict) and "alternative" in raw_it:
                     for item in raw_it["alternative"]:
                         tr = (item.get("transcript") or "").strip()
-                        if tr:
+                        if tr and tr not in alt_it:
                             alt_it.append(tr)
                     if alt_it:
                         best_it = alt_it[0]
                 elif isinstance(raw_it, str) and raw_it.strip():
                     best_it = raw_it.strip()
+                    alt_it = [best_it]
 
                 if best_it:
-                    # Se sembra una richiesta musicale, interroga anche il modello en-US
-                    # per catturare perfettamente eventuali titoli/artisti in inglese!
-                    lower_it = best_it.lower()
-                    if any(
-                        w in lower_it
-                        for w in ("metti", "riproduci", "suona", "play", "cerca", "ascoltiamo", "canzone")
+                    # Se nella seconda/terza ipotesi c'è "venus" o "metti" che mancava nella prima, promuovila!
+                    for cand in alt_it[1:]:
+                        cl = cand.lower()
+                        if ("venus" in cl or "venere" in cl) and (
+                            "venus" not in best_it.lower() and "venere" not in best_it.lower()
+                        ):
+                            best_it = cand
+                            break
+
+                    extra_hints = []
+                    if len(alt_it) > 1:
+                        others = [a for a in alt_it if a.lower() != best_it.lower()][:3]
+                        if others:
+                            extra_hints.extend(others)
+
+                    if self._looks_like_music_request(best_it) or any(
+                        self._looks_like_music_request(a) for a in alt_it
                     ):
-                        try:
-                            en_text = func(audio, language="en-US")
-                            if en_text and isinstance(en_text, str) and en_text.strip():
-                                en_clean = en_text.strip()
-                                if en_clean.lower() != lower_it:
-                                    return f"{best_it} [EN_HINT: {en_clean}]"
-                        except Exception:
-                            pass
+                        en_clean = self._recognize_google_en(recognizer, audio)
+                        if en_clean and en_clean.lower() != best_it.lower():
+                            extra_hints.insert(0, en_clean)
+
+                    if extra_hints:
+                        hint_str = " | ".join(extra_hints)
+                        logging.info(
+                            f"[STT: Google Multi-Hyp] IT='{best_it}' | HINTS='{hint_str}'"
+                        )
+                        return f"{best_it} [EN_HINT: {hint_str}]"
+
+                    logging.info(f"[STT: Google] '{best_it}'")
                     return best_it
         except sr.UnknownValueError:
             pass
@@ -723,36 +805,126 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
         return None
 
-    def _recognize_with_groq_whisper(self, audio: sr.AudioData) -> Optional[str]:
-        if ItalianSpeechSink._GROQ_WHISPER_DISABLED:
-            return None
+    @staticmethod
+    def _recognize_google_en(recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
+        try:
+            func = getattr(recognizer, "recognize_google", None)
+            if not func:
+                return None
+            raw_en = func(audio, language="en-US", show_all=True)
+            if isinstance(raw_en, dict) and "alternative" in raw_en:
+                alts = [
+                    (item.get("transcript") or "").strip()
+                    for item in raw_en["alternative"]
+                    if (item.get("transcript") or "").strip()
+                ]
+                return alts[0] if alts else None
+            if isinstance(raw_en, str) and raw_en.strip():
+                return raw_en.strip()
+        except Exception:
+            pass
+        return None
 
-        whisper_models = ItalianSpeechSink._GROQ_WHISPER_MODELS
+    def _recognize_with_deepgram(self, wav_bytes: bytes) -> Optional[str]:
+        try:
+            resp = requests.post(
+                "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true",
+                headers={
+                    "Authorization": f"Token {self.deepgram_api_key}",
+                    "Content-Type": "audio/wav",
+                },
+                data=wav_bytes,
+                timeout=3.5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                channels = data.get("results", {}).get("channels", [])
+                if channels:
+                    alts = channels[0].get("alternatives", [])
+                    if alts:
+                        transcript = (alts[0].get("transcript") or "").strip()
+                        if transcript:
+                            return transcript
+        except Exception as e:
+            logging.debug(f"Deepgram STT fallback: {e}")
+        return None
 
-        # Prompt bilingue e SENZA forzare language="it", così Whisper riconosce l'italiano
-        # e mantiene i titoli inglesi ("Blinding Lights", "Numb", "Bohemian Rhapsody") in inglese originale!
-        bilingual_prompt = (
-            "Venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume, autoplay. "
-            "Comandi vocali in italiano con titoli di canzoni in italiano o in inglese: "
-            "Venus metti Blinding Lights, The Weeknd, Bohemian Rhapsody, Queen, Eminem, Without Me, "
-            "Travis Scott, FE!N, Linkin Park, Numb, In the End, Imagine Dragons, Believer, Coldplay, "
-            "Geolier, Lazza, Sfera Ebbasta, Marracash, Vasco Rossi, Mahmood, Blanco, Annalisa."
+    def _recognize_with_gemini_audio(self, wav_bytes: bytes) -> Optional[str]:
+        import base64
+
+        b64_audio = base64.b64encode(wav_bytes).decode("ascii")
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": (
+                                "Trascrivi fedelmente questo comando vocale in italiano. "
+                                "Se l'utente pronuncia il titolo di una canzone o di un artista in inglese o italiano "
+                                "(es. dopo 'Venus metti...'), scrivi il titolo e l'artista con lo spelling corretto. "
+                                "Restituisci SOLO le parole pronunciate dall'utente, senza commenti né punteggiatura finale."
+                            )
+                        },
+                        {
+                            "inlineData": {
+                                "mimeType": "audio/wav",
+                                "data": b64_audio,
+                            }
+                        },
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 60,
+            },
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=3.8)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        text = (parts[0].get("text") or "").strip().strip("\"'`.")
+                        if text and len(text) <= 160:
+                            return text
+        except Exception as e:
+            logging.debug(f"Gemini Audio STT fallback: {e}")
+        return None
+
+    def _recognize_with_groq_whisper(
+        self, wav_bytes: bytes, language: Optional[str] = "it"
+    ) -> Optional[str]:
+        # Prompt minimale non inquinante: evita che Whisper allucini titoli di canzoni non pronunciati!
+        clean_prompt = (
+            "Venus, metti, riproduci, pausa, riprendi, salta, stop, volume."
+            if language == "it"
+            else "Venus, metti"
         )
 
-        try:
-            wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            for w_model in list(whisper_models):
-                resp = ItalianSpeechSink._HTTP_SESSION.post(
+        for w_model in self._GROQ_WHISPER_MODELS:
+            try:
+                form_data = {
+                    "model": w_model,
+                    "prompt": clean_prompt,
+                    "response_format": "json",
+                    "temperature": "0.0",
+                }
+                if language:
+                    form_data["language"] = language
+
+                resp = requests.post(
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {self.groq_api_key}"},
                     files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
-                    data={
-                        "model": w_model,
-                        "prompt": bilingual_prompt,
-                        "response_format": "json",
-                        "temperature": "0.0",
-                    },
-                    timeout=4,
+                    data=form_data,
+                    timeout=3.8,
                 )
                 if resp.status_code == 200:
                     payload = resp.json()
@@ -762,22 +934,22 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                         "sottotitoli e revisione a cura di",
                         "grazie per aver guardato",
                         "thank you for watching",
-                        "venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume, autoplay.",
+                        "venus, metti, riproduci, pausa, riprendi, salta, stop, volume.",
+                        "venus, metti",
+                        "venus.",
                         "...",
                     }
-                    if not text or text.lower() in hallucinations:
+                    if not text or text.lower().strip() in hallucinations:
                         return None
                     return text
-                elif resp.status_code in (403, 404):
-                    if w_model in whisper_models:
-                        whisper_models.remove(w_model)
-                    if not whisper_models:
-                        ItalianSpeechSink._GROQ_WHISPER_DISABLED = True
+                elif resp.status_code in (401, 403, 404):
+                    logging.debug(f"Groq Whisper ({w_model}) HTTP {resp.status_code}: {resp.text[:120]}")
                     continue
                 else:
                     break
-        except Exception as e:
-            logging.debug(f"Groq Whisper STT fallback a Google STT: {e}")
+            except Exception as e:
+                logging.debug(f"Groq Whisper STT ({w_model}) errore: {e}")
+                break
         return None
 
     @voice_recv.AudioSink.listener()

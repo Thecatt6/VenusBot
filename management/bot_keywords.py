@@ -225,34 +225,47 @@ class BotKeywords:
         if not text or not text.strip():
             return False, None, ""
 
+        # Estrai eventuale [EN_HINT: ...] per conservarlo nel comando residuo
+        en_hint_suffix = ""
+        en_hint_content = ""
+        m_hint = re.search(r"(\s*\[EN_HINT:\s*(.+?)\])$", text.strip(), flags=re.IGNORECASE)
+        if m_hint:
+            en_hint_suffix = m_hint.group(1)
+            en_hint_content = m_hint.group(2).strip()
+            cleaned_text = text[: m_hint.start()].strip()
+        else:
+            cleaned_text = text.strip()
+
         config = await self.loadConfig()
         keywords = [config["primary"]] + config["aliases"]
-        threshold = config.get("fuzzy_threshold", 0.78)
-
-        cleaned_text = text.strip()
+        # Aggiungi varianti fonetiche tipiche di "venus" nei motori STT italiani/inglesi
+        if "venus" in keywords:
+            for v_alias in ("venere", "vinus", "venos", "benus", "fenus", "menus"):
+                if v_alias not in keywords:
+                    keywords.append(v_alias)
+        threshold = config.get("fuzzy_threshold", 0.75)
 
         # 1. Controllo regex diretto (esatto o senza accenti) ovunque nella frase iniziale
-        # Ordina per lunghezza decrescente per dare priorità a wake word composte
         sorted_keywords = sorted(keywords, key=len, reverse=True)
         for kw in sorted_keywords:
             pattern = rf"^(?:(?:{'|'.join(ITALIAN_GREETING_PREFIXES)})[\s,.:;!?]+)*({re.escape(kw)})\b[\s,.:;!?]*(.*)$"
             m = re.match(pattern, cleaned_text, flags=re.IGNORECASE)
             if m:
-                return True, kw, m.group(2).strip()
+                rem = m.group(2).strip()
+                return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
 
             # Controllo anche se la wake word è preceduta da massimo 1-2 parole nella frase
             pattern_anywhere = rf"\b({re.escape(kw)})\b[\s,.:;!?]*(.*)$"
             m2 = re.search(pattern_anywhere, cleaned_text, flags=re.IGNORECASE)
-            if m2 and m2.start() <= 20:
-                return True, kw, m2.group(2).strip()
+            if m2 and m2.start() <= 24:
+                rem = m2.group(2).strip()
+                return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
 
         # 2. Controllo fonetico e fuzzy sulle prime parole della frase
-        # Tokenizza mantenendo gli indici nel testo originale
         tokens = list(re.finditer(r"[\wàèéìòùÀÈÉÌÒÙ]+", cleaned_text))
         if not tokens:
             return False, None, ""
 
-        # Salta eventuali prefissi di saluto iniziali ("ehi", "ok", "ciao")
         start_idx = 0
         while (
             start_idx < len(tokens) - 1
@@ -260,7 +273,6 @@ class BotKeywords:
         ):
             start_idx += 1
 
-        # Verifica sia dal token post-saluto sia dal token 0 (nel caso la wake word includa "ok ...")
         candidate_starts = [start_idx] if start_idx == 0 else [0, start_idx]
 
         for s_idx in candidate_starts:
@@ -273,12 +285,10 @@ class BotKeywords:
                 span_tokens = tokens[s_idx : s_idx + num_words]
                 spoken_phrase = " ".join(t.group(0).lower() for t in span_tokens)
 
-                # Confronto normalizzato senza accenti
                 norm_spoken = _strip_accents(spoken_phrase)
                 norm_kw = _strip_accents(kw)
                 ratio_direct = difflib.SequenceMatcher(None, norm_spoken, norm_kw).ratio()
 
-                # Confronto fonetico italiano
                 phon_spoken = " ".join(_italian_phonetic_key(t.group(0)) for t in span_tokens)
                 phon_kw = " ".join(_italian_phonetic_key(w) for w in kw_words)
                 ratio_phonetic = (
@@ -288,7 +298,6 @@ class BotKeywords:
                 )
 
                 best_ratio = max(ratio_direct, ratio_phonetic)
-                # Per parole molto corte (<= 3 caratteri) richiedi soglia più alta per evitare falsi positivi
                 effective_threshold = max(threshold, 0.88) if len(norm_kw) <= 3 else threshold
 
                 if best_ratio >= effective_threshold:
@@ -299,6 +308,22 @@ class BotKeywords:
                         f"Wake word '{kw}' rilevata tramite match fonetico/fuzzy "
                         f"('{spoken_phrase}', score={best_ratio:.2f})"
                     )
-                    return True, kw, remainder
+                    return True, kw, f"{remainder}{en_hint_suffix}".strip() if remainder else ""
+
+        # 3. Se la prima ipotesi non conteneva la wake word ma una delle ipotesi alternative in EN_HINT sì, usala!
+        if en_hint_content:
+            for alt_candidate in en_hint_content.split("|"):
+                alt_c = alt_candidate.strip()
+                if not alt_c:
+                    continue
+                for kw in sorted_keywords:
+                    m_alt = re.match(
+                        rf"^(?:(?:{'|'.join(ITALIAN_GREETING_PREFIXES)})[\s,.:;!?]+)*({re.escape(kw)})\b[\s,.:;!?]*(.*)$",
+                        alt_c,
+                        flags=re.IGNORECASE,
+                    )
+                    if m_alt:
+                        rem = m_alt.group(2).strip()
+                        return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
 
         return False, None, ""
