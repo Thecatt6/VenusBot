@@ -11,13 +11,23 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import aiohttp
 import discord
+from discord.opus import Decoder, OpusError
 from discord.ext import voice_recv
+from discord.ext.voice_recv import gateway as vr_gateway
+from discord.ext.voice_recv import opus as vr_opus
+from discord.ext.voice_recv import video as vr_video
+from discord.ext.voice_recv import voice_client as vr_vc
 from discord.ext.voice_recv.rtp import SilencePacket
 import speech_recognition as sr
+
+try:
+    import davey
+except ImportError:
+    davey = None
 
 try:
     import edge_tts
@@ -32,10 +42,184 @@ except ImportError:
     HAS_GTTS = False
 
 
+def patch_voice_recv_for_dave() -> None:
+    """
+    Applica la patch di compatibilità per il protocollo Discord DAVE (E2EE, Voice Gateway v8, close code 4017)
+    a `discord-ext-voice-recv`:
+    1. Evita KeyError su opcode 12 (CLIENT_CONNECT / VIDEO in v8) quando 'streams' o 'video_ssrc' non sono presenti.
+    2. Decifra i frame vocali in ingresso con `davey.DaveSession.decrypt` prima della decodifica Opus.
+    3. Protegge il decoder Opus da eventuali frame corrotti durante il cambio di epoca MLS.
+    """
+    if getattr(vr_opus.PacketDecoder, "_dave_patched", False):
+        return
+
+    # 1. Rendere VoiceVideoStreams tollerante ai payload CLIENT_CONNECT (op 12) del Gateway v8
+    def _safe_video_streams_init(self, *, data, vc):
+        self.audio_ssrc = data.get("audio_ssrc", 0)
+        self.video_ssrc = data.get("video_ssrc", 0)
+        self.member = vc.guild.get_member(int(data["user_id"])) if "user_id" in data else None
+        self.streams = self._get_streams(data.get("streams") or [])
+
+    vr_video.VoiceVideoStreams.__init__ = _safe_video_streams_init
+
+    # 2. Rendere gateway.hook sicuro con i nuovi opcodes DAVE/MLS (21-31) di Discord Voice v8
+    _orig_hook = vr_gateway.hook
+
+    async def _safe_dave_hook(ws, msg: Dict[str, Any]):
+        if not isinstance(msg, dict):
+            return
+        op = msg.get("op")
+        data = msg.get("d")
+        # Alcuni pacchetti di controllo DAVE/v8 possono avere 'd' non-dict o vuoto
+        if not isinstance(data, dict):
+            return
+        try:
+            await _orig_hook(ws, msg)
+        except Exception as e:
+            logging.debug(f"Ignorato errore hook voice_recv su op={op}: {e}")
+
+    vr_gateway.hook = _safe_dave_hook
+    vr_vc.hook = _safe_dave_hook
+
+    # 3. Patch su PacketDecoder per decifrare il livello E2EE DAVE (`davey`) in ricezione
+    _orig_init = vr_opus.PacketDecoder.__init__
+    _orig_reset = vr_opus.PacketDecoder.reset
+
+    def _patched_init(self, router, ssrc: int):
+        _orig_init(self, router, ssrc)
+        self._dave_ok: Set[int] = set()
+        self._dave_bad: Set[int] = set()
+        self._dave_drops: int = 0
+        self._opus_errors: int = 0
+
+    def _patched_reset(self) -> None:
+        _orig_reset(self)
+        if hasattr(self, "_dave_ok"):
+            self._dave_ok.clear()
+        if hasattr(self, "_dave_bad"):
+            self._dave_bad.clear()
+
+    def _dave_decrypt_inner(self, packet: Any) -> bool:
+        if packet.is_silence():
+            return True
+
+        vc = self.sink.voice_client
+        state = getattr(vc, "_connection", None)
+        if not getattr(state, "dave_protocol_version", 0):
+            return True
+
+        session = getattr(state, "dave_session", None)
+        if session is None or not session.ready:
+            return False
+
+        user_id = self._cached_id
+        if user_id is None:
+            user_id = self._cached_id = vc._get_id_from_ssrc(self.ssrc)
+        if user_id is None:
+            return False
+
+        try:
+            packet.decrypted_data = session.decrypt(
+                int(user_id), davey.MediaType.audio, bytes(packet.decrypted_data)
+            )
+            return True
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            if "UnencryptedWhenPassthroughDisabled" in (str(e) or repr(e)):
+                return True
+            self._dave_drops = getattr(self, "_dave_drops", 0) + 1
+            if self._dave_drops == 1 or self._dave_drops % 250 == 0:
+                logging.debug(
+                    f"DAVE: ignorati {self._dave_drops} frame durante transizione MLS su ssrc {self.ssrc} ({e})"
+                )
+            return False
+
+    def _dave_decrypt(self, packet: Any, *, peek: bool = False) -> bool:
+        if davey is None or not packet or not packet.decrypted_data:
+            return True
+
+        seq = packet.sequence
+        if not peek:
+            if seq in self._dave_ok:
+                self._dave_ok.discard(seq)
+                return True
+            if seq in self._dave_bad:
+                self._dave_bad.discard(seq)
+                return False
+
+        ok = self._dave_decrypt_inner(packet)
+        if peek:
+            if len(self._dave_ok) + len(self._dave_bad) > 64:
+                self._dave_ok.clear()
+                self._dave_bad.clear()
+            (self._dave_ok if ok else self._dave_bad).add(seq)
+        return ok
+
+    def _decode_safe(self, data: Optional[bytes], *, fec: bool) -> bytes:
+        assert self._decoder is not None
+        try:
+            return self._decoder.decode(data, fec=fec)
+        except OpusError as e:
+            self._opus_errors = getattr(self, "_opus_errors", 0) + 1
+            if self._opus_errors == 1 or self._opus_errors % 250 == 0:
+                logging.debug(f"Opus decode warning su ssrc {self.ssrc}: {e}")
+        try:
+            return self._decoder.decode(None, fec=False)
+        except OpusError:
+            return b"\x00" * Decoder.FRAME_SIZE
+
+    def _patched_decode_packet(self, packet: Any) -> Tuple[Any, bytes]:
+        assert self._decoder is not None
+        if packet:
+            pcm = self._decode_safe(packet.decrypted_data, fec=False)
+            return packet, pcm
+
+        next_packet = self._buffer.peek_next()
+        if next_packet is not None and self._dave_decrypt(next_packet, peek=True):
+            nextdata: bytes = next_packet.decrypted_data  # type: ignore
+            pcm = self._decode_safe(nextdata, fec=True)
+        else:
+            pcm = self._decode_safe(None, fec=False)
+        return packet, pcm
+
+    def _patched_process_packet(self, packet: Any) -> Optional[vr_opus.VoiceData]:
+        pcm = None
+        member = self._get_cached_member()
+        if member is None:
+            self._cached_id = self.sink.voice_client._get_id_from_ssrc(self.ssrc)
+            member = self._get_cached_member()
+
+        self._last_seq = packet.sequence
+        self._last_ts = packet.timestamp
+
+        if not self._dave_decrypt(packet):
+            return None
+
+        if not self.sink.wants_opus():
+            packet, pcm = self._decode_packet(packet)
+
+        return vr_opus.VoiceData(packet, member, pcm=pcm)
+
+    vr_opus.PacketDecoder.__init__ = _patched_init
+    vr_opus.PacketDecoder.reset = _patched_reset
+    vr_opus.PacketDecoder._dave_decrypt_inner = _dave_decrypt_inner
+    vr_opus.PacketDecoder._dave_decrypt = _dave_decrypt
+    vr_opus.PacketDecoder._decode_safe = _decode_safe
+    vr_opus.PacketDecoder._decode_packet = _patched_decode_packet
+    vr_opus.PacketDecoder._process_packet = _patched_process_packet
+    vr_opus.PacketDecoder._dave_patched = True
+    logging.info("Supporto protocollo vocale Discord DAVE (E2EE v8) attivato.")
+
+
+# Attiva subito la patch all'importazione del modulo
+patch_voice_recv_for_dave()
+
+
 # Voci neurali italiane disponibili su Edge TTS (gratuite, cloud-based)
 ITALIAN_TTS_VOICES: Dict[str, str] = {
-    "diego": "it-IT-DiegoNeural",        # Voce maschile moderna (default)
-    "elsa": "it-IT-ElsaNeural",          # Voce femminile stile assistente
+    "diego": "it-IT-DiegoNeural",        # Voce maschile moderna
+    "elsa": "it-IT-ElsaNeural",          # Voce femminile stile assistente (default)
     "isabella": "it-IT-IsabellaNeural",  # Voce femminile calda/espressiva
     "giuseppe": "it-IT-GiuseppeNeural",  # Voce maschile naturale
 }
@@ -160,22 +344,17 @@ class ItalianTTSEngine:
         """Pulisce il testo da markdown, URL ed emoji per una pronuncia fluida in italiano."""
         if not text:
             return ""
-        # Rimuovi blocchi di codice e URL
         cleaned = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
         cleaned = re.sub(r"https?://\S+", "", cleaned)
-        # Rimuovi formattazione markdown (*, _, ~, `, #)
         cleaned = re.sub(r"[*_~`#>]+", "", cleaned)
-        # Sostituisci simboli comuni per la lettura vocale
         cleaned = cleaned.replace("%", " percento ")
         cleaned = cleaned.replace("&", " e ")
-        # Rimuovi emoji e caratteri non pronunciabili lasciando punteggiatura e lettere accentate
         cleaned = re.sub(
             r"[^\w\s.,!?;:'\"()\-àèéìòùÀÈÉÌÒÙ€$°]",
             " ",
             cleaned,
         )
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        # Limita la lunghezza massima per evitare monologhi eccessivi in canale vocale
         if len(cleaned) > 650:
             cleaned = cleaned[:647].rsplit(" ", 1)[0] + "."
         return cleaned
@@ -223,10 +402,6 @@ class ItalianTTSEngine:
 class ItalianDiscordAudioSource(sr.AudioSource):
     """
     AudioSource ottimizzata per Discord a 48kHz stereo -> mono senza clipping.
-    Risolve i bug della DiscordSRAudioSource standard:
-    - Allineamento rigoroso a 4 byte (frame stereo 16-bit)
-    - Conversione stereo->mono con fattore (0.5, 0.5) per evitare distorsioni e saturazione
-    - Timeout ridotto a fine parlato per una risposta rapida dell'assistente
     """
 
     little_endian = True
@@ -251,11 +426,8 @@ class ItalianDiscordAudioSource(sr.AudioSource):
         self._entered = False
 
     def read(self, size: int) -> bytes:
-        # Ogni frame stereo 16-bit occupa 4 byte (2 canali * 2 byte)
         bytes_needed = size * self.CHANNELS * self.SAMPLE_WIDTH
 
-        # Attendi fino a ~0.45s che arrivino pacchetti RTP da Discord;
-        # quando l'utente smette di parlare, Discord interrompe l'invio e restituiamo b''
         for _ in range(9):
             if len(self.buffer) < bytes_needed:
                 time.sleep(0.05)
@@ -266,7 +438,6 @@ class ItalianDiscordAudioSource(sr.AudioSource):
                 return b""
 
         available = min(bytes_needed, len(self.buffer))
-        # Allinea sempre a multipli di 4 byte (1 frame stereo 16-bit)
         aligned = available - (available % 4)
         if aligned <= 0:
             return b""
@@ -274,7 +445,6 @@ class ItalianDiscordAudioSource(sr.AudioSource):
         audiochunk = self.buffer[:aligned].tobytes()
         del self.buffer[:aligned]
 
-        # 0.5 e 0.5 evitano il clipping/overflow quando entrambi i canali sono attivi
         mono_chunk = audioop.tomono(audiochunk, self.SAMPLE_WIDTH, 0.5, 0.5)
         return mono_chunk
 
@@ -284,13 +454,7 @@ class ItalianDiscordAudioSource(sr.AudioSource):
 
 class ItalianSpeechSink(voice_recv.AudioSink):
     """
-    Sink vocale Discord progettato per riconoscere con alta precisione l'italiano
-    (inclusi titoli di canzoni straniere pronunciati da utenti italiani).
-
-    Supporta:
-    1. Groq Cloud Whisper (`whisper-large-v3-turbo`, gratuito con GROQ_API_KEY)
-    2. Google Cloud Web Speech API (`it-IT`, gratuito senza alcuna API key) come motore
-       predefinito o di fallback immediato.
+    Sink vocale Discord progettato per riconoscere con alta precisione l'italiano.
     """
 
     def __init__(
@@ -349,12 +513,6 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         return callback
 
     def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
-        """
-        Trascrive l'audio in italiano:
-        - Ignora frammenti troppo brevi (< 0.25s) o puro rumore di fondo
-        - Usa Groq Whisper Large v3 Turbo se GROQ_API_KEY è impostata
-        - Altrimenti (o in fallback) usa Google Speech Recognition con language='it-IT'
-        """
         try:
             raw_bytes = audio.frame_data
             duration_sec = len(raw_bytes) / (audio.sample_rate * audio.sample_width)
@@ -365,13 +523,11 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         except Exception:
             pass
 
-        # 1. Prova Groq Whisper Cloud (se configurato) per precisione superiore in italiano
         if self.groq_api_key:
             whisper_text = self._recognize_with_groq_whisper(audio)
             if whisper_text:
                 return whisper_text
 
-        # 2. Google Speech Recognition configurato esplicitamente per l'Italiano (it-IT)
         try:
             func = getattr(recognizer, "recognize_google", None)
             if func:
@@ -388,11 +544,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         return None
 
     def _recognize_with_groq_whisper(self, audio: sr.AudioData) -> Optional[str]:
-        """Usa l'API cloud gratuita di Groq (whisper-large-v3-turbo) per trascrivere l'audio in italiano."""
         import requests
 
         try:
-            # Ricampiona a 16kHz mono per un upload istantaneo (< 30KB)
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
             resp = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -409,7 +563,6 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             if resp.status_code == 200:
                 payload = resp.json()
                 text = (payload.get("text") or "").strip()
-                # Filtra aloni tipici di Whisper sul silenzio
                 hallucinations = {
                     "sottotitoli creati dalla comunità amara.org",
                     "sottotitoli e revisione a cura di",

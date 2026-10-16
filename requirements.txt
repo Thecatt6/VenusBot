@@ -8,8 +8,9 @@ certifi==2025.4.26
 cffi==1.17.1
 charset-normalizer==3.4.2
 click==8.1.8
+davey==0.1.7
 discord-ext-voice_recv @ git+https://github.com/VenusMods/discord-ext-voice-recv.git@5d15c470073d28e2fa8dc155e65c54768f251b69
-discord.py==2.6.4
+discord.py==2.7.1
 dotenv==0.9.9
 edge-tts==7.3.1
 frozenlist==1.7.0
