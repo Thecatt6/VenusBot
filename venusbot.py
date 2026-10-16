@@ -35,6 +35,18 @@ logging.basicConfig(
 
 logging.getLogger("discord").setLevel(logging.WARNING)
 
+# Caricamento automatico di libopus su Linux / Docker
+if not discord.opus.is_loaded():
+    for _opus_candidate in ("libopus.so.0", "libopus.so", "opus"):
+        try:
+            discord.opus.load_opus(_opus_candidate)
+            if discord.opus.is_loaded():
+                logging.info(f"Libreria audio Opus caricata con successo ({_opus_candidate}).")
+                break
+        except Exception:
+            continue
+
+
 
 class VenusBot(discord.Client):
     def __init__(self):

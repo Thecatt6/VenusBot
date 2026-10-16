@@ -64,10 +64,26 @@ SPOTIFY_CLIENT_REFRESH_TOKEN=''
 ```
 > 💡 **Nota**: Il bot funziona **anche senza inserire `GROQ_API_KEY` o `GEMINI_API_KEY`** grazie al motore Google STT (`it-IT`) e al fallback AI Cloud integrato, ma inserire una chiave gratuita **Groq** è consigliato per avere latenza ultra-bassa (~200ms) e trascrizione vocale con **Whisper Large v3 Turbo**.
 
-### 4. Avvio del Bot
+### 4. Avvio del Bot (Locale)
 ```bash
 python venusbot.py
 ```
+
+### 🐳 Avvio con Docker / Docker Compose (Consigliato per 24/7)
+Il repository include già `Dockerfile` e `docker-compose.yml` con tutte le librerie audio necessarie (`ffmpeg`, `libopus`, `flac`, `libsodium`) preconfigurate:
+
+```bash
+# 1. Configura il file .env con il tuo DISCORD_TOKEN (e opzionalmente GROQ_API_KEY)
+nano .env
+
+# 2. Costruisci e avvia il container in background (24/7 con riavvio automatico)
+docker compose up -d --build
+
+# 3. Visualizza i log in tempo reale
+docker compose logs -f
+```
+> La cartella `./management` è montata come volume persistente, quindi la **parola di attivazione** (`/setwakeword`), gli **admin** e i **contatori** rimangono salvati anche se ricrei o aggiorni il container.
+
 
 ---
 

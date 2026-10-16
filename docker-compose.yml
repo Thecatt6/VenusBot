@@ -1,0 +1,14 @@
+services:
+  venusbot:
+    build: .
+    container_name: venusbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Rome
+    volumes:
+      # Mantiene persistenti la wake word, gli admin, i ban e i contatori anche se aggiorni il container
+      - ./management:/app/management
+      # Opzionale: monta cookies.txt se presente per YouTube
+      - ./cookies.txt:/app/cookies.txt
