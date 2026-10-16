@@ -83,12 +83,10 @@ class AssistantResponse:
 class AIAssistant:
     """
     Cervello intelligente in stile Google Assistant per VenusBot.
-    - Riconosce istantaneamente comandi musicali in italiano e inglese (Fast-Path)
-    - Risponde a qualsiasi domanda generale, curiosità, calcolo o richiesta complessa
-      usando i migliori provider Cloud AI gratuiti:
-        1. Groq Cloud (rileva automaticamente i modelli attivi sul tuo account Groq)
-        2. Google Gemini (Gemini Flash con GEMINI_API_KEY)
-        3. Pollinations Cloud AI (Fallback cloud gratuito zero-config senza API key)
+    - Riconosce istantaneamente i comandi di controllo (pausa, salta, stop, volume, ora/data)
+    - Corregge foneticamente i titoli di canzoni in inglese e italiano pronunciati a voce
+      (es. "blanding laits" -> "The Weeknd - Blinding Lights")
+    - Risponde a qualsiasi domanda generale parlando nel canale vocale.
     """
 
     def __init__(self):
@@ -105,14 +103,17 @@ class AIAssistant:
         self._history.pop(guild_id, None)
 
     def _match_fast_command(self, text: str) -> Optional[AssistantResponse]:
+        """
+        Comandi di controllo istantaneo che non richiedono correzione fonetica di titoli musicali.
+        """
         raw = text.strip()
         clean = re.sub(r"[.!?]+$", "", raw).strip()
         lower = clean.lower()
 
         if not lower:
             return AssistantResponse(
-                action="none",
-                voice_reply="Sì? Dimmi pure, ti ascolto.",
+                action="listen_followup",
+                voice_reply="Dimmi pure.",
             )
 
         # 1. Pausa
@@ -216,42 +217,29 @@ class AIAssistant:
                 voice_reply=f"Oggi è {get_italian_datetime_str().split(',')[0]}.",
             )
 
-        # 11. Riproduzione diretta di una canzone specifica
+        return None
+
+    @staticmethod
+    def _extract_Explicit_play_query(text: str) -> Optional[str]:
+        """Se la frase inizia con 'metti/riproduci/suona/play ...', estrae la query grezza per eventuale fallback."""
+        clean = re.sub(r"[.!?]+$", "", text.strip()).strip()
         m_play = re.match(
             r"^(?:riproduci|metti(?:\s+su)?|suona|fai\s+partire|ascoltiamo|play)\s+(.+)$",
             clean,
             flags=re.IGNORECASE,
         )
         if m_play:
-            song_query = m_play.group(1).strip()
-            vague_prefixes = (
-                "qualcosa ",
-                "una canzone ",
-                "un brano ",
-                "della musica ",
-                "un pezzo ",
-            )
-            if not any(song_query.lower().startswith(vp) for vp in vague_prefixes):
-                song_query = re.sub(
-                    r"\s+(?:su\s+youtube|su\s+spotify|per\s+favore|per\s+piacere)$",
-                    "",
-                    song_query,
-                    flags=re.IGNORECASE,
-                ).strip()
-                if song_query:
-                    return AssistantResponse(
-                        action="play",
-                        query=song_query,
-                        voice_reply=f"Cerco e riproduco {song_query}.",
-                    )
-
+            q = m_play.group(1).strip()
+            q = re.sub(
+                r"\s+(?:su\s+youtube|su\s+spotify|per\s+favore|per\s+piacere)$",
+                "",
+                q,
+                flags=re.IGNORECASE,
+            ).strip()
+            return q or None
         return None
 
     async def _get_groq_candidate_models(self, session: aiohttp.ClientSession) -> List[str]:
-        """
-        Interroga l'endpoint /openai/v1/models di Groq per scoprire esattamente quali modelli
-        chat sono abilitati e attivi sull'account dell'utente, evitando qualsiasi errore 404.
-        """
         if self._discovered_groq_models:
             return self._discovered_groq_models
 
@@ -317,25 +305,27 @@ class AIAssistant:
         if fast is not None:
             return fast
 
+        explicit_song_fallback = self._extract_Explicit_play_query(user_text)
+
         system_prompt = (
-            "Sei Venus, un assistente vocale intelligente in stile Google Assistant integrato in un canale vocale Discord.\n"
+            "Sei Venus, un assistente vocale intelligente in stile Google Assistant in un canale vocale Discord.\n"
             f"Data e ora attuale in Italia: {get_italian_datetime_str()}.\n"
-            f"Utente che sta parlando: {user_name}.\n"
-            f"Brano attualmente in riproduzione: {current_song or 'Nessuno'}.\n"
-            f"Brani in coda: {queue_count}.\n\n"
-            "COMPITO:\n"
-            "L'utente ti ha parlato a voce in italiano. Può farti una domanda di cultura generale, attualità, matematica, "
-            "conversazione, barzellette, consigli, oppure chiederti di controllare la musica.\n"
-            "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido con questa struttura esatta:\n"
+            f"Utente: {user_name}. Brano attuale: {current_song or 'Nessuno'}. Brani in coda: {queue_count}.\n\n"
+            "REGOLA FONDAMENTALE PER LA MUSICA:\n"
+            "- Se l'utente chiede di mettere/riprodurre/suonare una canzone o un artista (in italiano o in inglese), "
+            "imposta \"action\": \"play\".\n"
+            "- Poiché l'utente parla al microfono con accento italiano, i titoli o gli artisti INGLESI potrebbero essere "
+            "trascritti foneticamente o storpiati (es. 'blanding laits' -> 'The Weeknd - Blinding Lights', "
+            "'smels laik tin spirit' -> 'Nirvana - Smells Like Teen Spirit', 'boemian rapsodi' -> 'Queen - Bohemian Rhapsody', "
+            "'fein' -> 'Travis Scott - FE!N', 'starboi' -> 'The Weeknd - Starboy', 'nam' -> 'Linkin Park - Numb').\n"
+            "- Ricostruisci SEMPRE il vero titolo ufficiale della canzone e l'artista musicale reale nel campo \"query\" "
+            "usando il formato 'Artista - Titolo Canzone'. NON cercare MAI video di YouTuber, gameplay o vlog: solo vere canzoni!\n\n"
+            "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido:\n"
             "{\n"
             '  "action": "none" | "play" | "pause" | "resume" | "skip" | "stop" | "loop" | "shuffle" | "volume_up" | "volume_down" | "volume_set" | "now_playing" | "disconnect",\n'
-            '  "query": "titolo e artista precisi da cercare su YouTube (solo se action è play) oppure numero 1-100 (solo se action è volume_set), altrimenti stringa vuota",\n'
-            '  "voice_reply": "La tua risposta parlata in italiano naturale, amichevole, concisa (massimo 2-3 frasi brevi) e pronta per essere letta ad alta voce da un sintetizzatore vocale. Non usare elenchi puntati, asterischi o markdown."\n'
-            "}\n"
-            "Esempi:\n"
-            '- Se l\'utente chiede "Chi ha scoperto l\'America?": {"action": "none", "query": "", "voice_reply": "L\'America è stata raggiunta da Cristoforo Colombo il 12 ottobre 1492."}\n'
-            '- Se l\'utente chiede "Metti una canzone famosa dei Queen": {"action": "play", "query": "Queen Bohemian Rhapsody", "voice_reply": "Certamente, metto subito Bohemian Rhapsody dei Queen!"}\n'
-            '- Se l\'utente chiede "Raccontami una battuta": {"action": "none", "query": "", "voice_reply": "Qual è il colmo per un elettricista? Non trovare mai la lampadina giusta per avere un\'idea brillante!"}'
+            '  "query": "Artista - Titolo Canzone (solo se action è play) oppure numero 1-100 (solo se action è volume_set), altrimenti stringa vuota",\n'
+            '  "voice_reply": "Risposta parlata in italiano naturale e concisa (1-2 frasi brevi), senza asterischi o markdown."\n'
+            "}"
         )
 
         history = list(self._history[guild_id])
@@ -354,7 +344,14 @@ class AIAssistant:
         if not raw_reply:
             raw_reply = await self._call_free_cloud_fallback(messages)
 
-        parsed = self._parse_ai_response(raw_reply)
+        if not raw_reply and explicit_song_fallback:
+            return AssistantResponse(
+                action="play",
+                query=explicit_song_fallback,
+                voice_reply=f"Riproduco {explicit_song_fallback}.",
+            )
+
+        parsed = self._parse_ai_response(raw_reply, explicit_song_fallback)
 
         self._history[guild_id].append({"role": "user", "content": user_text})
         self._history[guild_id].append(
@@ -377,19 +374,17 @@ class AIAssistant:
                     payload = {
                         "model": model_name,
                         "messages": messages,
-                        "temperature": 0.4,
+                        "temperature": 0.3,
                         "max_tokens": 350,
                     }
                     async with session.post(url, headers=headers, json=payload) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             content = data["choices"][0]["message"].get("content") or ""
-                            # Rimuovi eventuali blocchi <think>...</think> di modelli reasoning (es. Qwen)
                             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
                             if content:
                                 return content
                         elif resp.status == 404:
-                            # Rimuovi il modello non disponibile dalla cache e prova il successivo
                             if self._discovered_groq_models and model_name in self._discovered_groq_models:
                                 self._discovered_groq_models.remove(model_name)
                             continue
@@ -418,7 +413,7 @@ class AIAssistant:
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": contents,
                 "generationConfig": {
-                    "temperature": 0.4,
+                    "temperature": 0.3,
                     "maxOutputTokens": 350,
                     "responseMimeType": "application/json",
                 },
@@ -445,7 +440,7 @@ class AIAssistant:
         payload = {
             "model": "openai",
             "messages": messages,
-            "temperature": 0.4,
+            "temperature": 0.3,
             "jsonMode": True,
         }
         try:
@@ -461,8 +456,16 @@ class AIAssistant:
             logging.warning(f"Errore fallback cloud AI: {e}")
         return None
 
-    def _parse_ai_response(self, raw_reply: Optional[str]) -> AssistantResponse:
+    def _parse_ai_response(
+        self, raw_reply: Optional[str], explicit_song_fallback: Optional[str] = None
+    ) -> AssistantResponse:
         if not raw_reply:
+            if explicit_song_fallback:
+                return AssistantResponse(
+                    action="play",
+                    query=explicit_song_fallback,
+                    voice_reply=f"Riproduco {explicit_song_fallback}.",
+                )
             return AssistantResponse(
                 action="none",
                 voice_reply="Mi dispiace, al momento non riesco a elaborare la risposta.",
@@ -479,6 +482,8 @@ class AIAssistant:
                     action = str(obj.get("action") or "none").strip().lower()
                     query = str(obj.get("query") or "").strip()
                     voice_reply = str(obj.get("voice_reply") or obj.get("reply") or "").strip()
+                    if action == "play" and not query and explicit_song_fallback:
+                        query = explicit_song_fallback
                     if not voice_reply and action == "play" and query:
                         voice_reply = f"Riproduco {query}."
                     return AssistantResponse(
@@ -488,6 +493,13 @@ class AIAssistant:
                     )
             except Exception as e:
                 logging.debug(f"Parsing JSON risposta AI fallito, uso testo diretto: {e}")
+
+        if explicit_song_fallback:
+            return AssistantResponse(
+                action="play",
+                query=explicit_song_fallback,
+                voice_reply=f"Riproduco {explicit_song_fallback}.",
+            )
 
         plain_text = re.sub(r"```.*?```", "", cleaned, flags=re.DOTALL).strip()
         return AssistantResponse(action="none", query="", voice_reply=plain_text)

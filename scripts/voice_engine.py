@@ -9,16 +9,18 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
-import aiohttp
 import discord
 from discord.opus import Decoder, OpusError
 from discord.ext import voice_recv
 from discord.ext.voice_recv import gateway as vr_gateway
 from discord.ext.voice_recv import opus as vr_opus
+from discord.ext.voice_recv import reader as vr_reader
 from discord.ext.voice_recv import video as vr_video
 from discord.ext.voice_recv import voice_client as vr_vc
 from discord.ext.voice_recv.rtp import SilencePacket
@@ -42,18 +44,20 @@ except ImportError:
     HAS_GTTS = False
 
 
+# Silenzia i warning/errori interni innocui di discord-ext-voice-recv (pacchetti RTCP/comfort noise)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.CRITICAL)
+logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR)
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
+
+
 def patch_voice_recv_for_dave() -> None:
     """
     Applica la patch di compatibilità per il protocollo Discord DAVE (E2EE, Voice Gateway v8, close code 4017)
-    a `discord-ext-voice-recv`:
-    1. Evita KeyError su opcode 12 (CLIENT_CONNECT / VIDEO in v8) quando 'streams' o 'video_ssrc' non sono presenti.
-    2. Decifra i frame vocali in ingresso con `davey.DaveSession.decrypt` prima della decodifica Opus.
-    3. Protegge il decoder Opus da eventuali frame corrotti durante il cambio di epoca MLS.
+    a `discord-ext-voice-recv`.
     """
     if getattr(vr_opus.PacketDecoder, "_dave_patched", False):
         return
 
-    # 1. Rendere VoiceVideoStreams tollerante ai payload CLIENT_CONNECT (op 12) del Gateway v8
     def _safe_video_streams_init(self, *, data, vc):
         self.audio_ssrc = data.get("audio_ssrc", 0)
         self.video_ssrc = data.get("video_ssrc", 0)
@@ -62,7 +66,6 @@ def patch_voice_recv_for_dave() -> None:
 
     vr_video.VoiceVideoStreams.__init__ = _safe_video_streams_init
 
-    # 2. Rendere gateway.hook sicuro con i nuovi opcodes DAVE/MLS (21-31) di Discord Voice v8
     _orig_hook = vr_gateway.hook
 
     async def _safe_dave_hook(ws, msg: Dict[str, Any]):
@@ -70,7 +73,6 @@ def patch_voice_recv_for_dave() -> None:
             return
         op = msg.get("op")
         data = msg.get("d")
-        # Alcuni pacchetti di controllo DAVE/v8 possono avere 'd' non-dict o vuoto
         if not isinstance(data, dict):
             return
         try:
@@ -81,7 +83,6 @@ def patch_voice_recv_for_dave() -> None:
     vr_gateway.hook = _safe_dave_hook
     vr_vc.hook = _safe_dave_hook
 
-    # 3. Patch su PacketDecoder per decifrare il livello E2EE DAVE (`davey`) in ricezione
     _orig_init = vr_opus.PacketDecoder.__init__
     _orig_reset = vr_opus.PacketDecoder.reset
 
@@ -129,10 +130,6 @@ def patch_voice_recv_for_dave() -> None:
             if "UnencryptedWhenPassthroughDisabled" in (str(e) or repr(e)):
                 return True
             self._dave_drops = getattr(self, "_dave_drops", 0) + 1
-            if self._dave_drops == 1 or self._dave_drops % 250 == 0:
-                logging.debug(
-                    f"DAVE: ignorati {self._dave_drops} frame durante transizione MLS su ssrc {self.ssrc} ({e})"
-                )
             return False
 
     def _dave_decrypt(self, packet: Any, *, peek: bool = False) -> bool:
@@ -160,10 +157,8 @@ def patch_voice_recv_for_dave() -> None:
         assert self._decoder is not None
         try:
             return self._decoder.decode(data, fec=fec)
-        except OpusError as e:
+        except OpusError:
             self._opus_errors = getattr(self, "_opus_errors", 0) + 1
-            if self._opus_errors == 1 or self._opus_errors % 250 == 0:
-                logging.debug(f"Opus decode warning su ssrc {self.ssrc}: {e}")
         try:
             return self._decoder.decode(None, fec=False)
         except OpusError:
@@ -212,16 +207,14 @@ def patch_voice_recv_for_dave() -> None:
     logging.info("Supporto protocollo vocale Discord DAVE (E2EE v8) attivato.")
 
 
-# Attiva subito la patch all'importazione del modulo
 patch_voice_recv_for_dave()
 
 
-# Voci neurali italiane disponibili su Edge TTS (gratuite, cloud-based)
 ITALIAN_TTS_VOICES: Dict[str, str] = {
-    "diego": "it-IT-DiegoNeural",        # Voce maschile moderna
-    "elsa": "it-IT-ElsaNeural",          # Voce femminile stile assistente (default)
-    "isabella": "it-IT-IsabellaNeural",  # Voce femminile calda/espressiva
-    "giuseppe": "it-IT-GiuseppeNeural",  # Voce maschile naturale
+    "diego": "it-IT-DiegoNeural",
+    "elsa": "it-IT-ElsaNeural",
+    "isabella": "it-IT-IsabellaNeural",
+    "giuseppe": "it-IT-GiuseppeNeural",
 }
 
 
@@ -248,7 +241,6 @@ class InterruptibleOpusSource(discord.AudioSource):
         override_source: discord.AudioSource,
         on_end: Optional[Callable[[float], None]] = None,
     ) -> None:
-        """Sostituisce temporaneamente il flusso musicale con la risposta vocale TTS."""
         with self._lock:
             if self._override_source is not None:
                 try:
@@ -260,7 +252,6 @@ class InterruptibleOpusSource(discord.AudioSource):
             self._on_override_end = on_end
 
     def cancel_interrupt(self) -> None:
-        """Interrompe eventuale TTS in corso e torna subito alla musica."""
         with self._lock:
             self._finish_override_locked()
 
@@ -291,7 +282,6 @@ class InterruptibleOpusSource(discord.AudioSource):
                 data = self._override_source.read()
                 if data:
                     return data
-                # Il TTS è terminato: ripristina il flusso musicale principale
                 self._finish_override_locked()
 
             return self.main_source.read()
@@ -313,8 +303,6 @@ class InterruptibleOpusSource(discord.AudioSource):
 class ItalianTTSEngine:
     """
     Motore Text-to-Speech (TTS) cloud gratuito in italiano.
-    Usa Microsoft Edge Neural TTS (`edge-tts`) per una voce naturale da vero assistente vocale,
-    con fallback automatico a Google TTS (`gTTS`).
     """
 
     def __init__(self, default_voice: Optional[str] = None):
@@ -341,7 +329,6 @@ class ItalianTTSEngine:
 
     @staticmethod
     def clean_text_for_speech(text: str) -> str:
-        """Pulisce il testo da markdown, URL ed emoji per una pronuncia fluida in italiano."""
         if not text:
             return ""
         cleaned = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
@@ -360,14 +347,12 @@ class ItalianTTSEngine:
         return cleaned
 
     async def synthesize_to_file(self, text: str) -> Optional[Path]:
-        """Genera un file audio MP3 con la risposta vocale in italiano."""
         clean_text = self.clean_text_for_speech(text)
         if not clean_text:
             return None
 
         output_path = self.temp_dir / f"tts_{uuid.uuid4().hex[:10]}.mp3"
 
-        # 1. Prova Edge Neural TTS (qualità neurale superiore, cloud gratuito)
         if HAS_EDGE_TTS:
             try:
                 communicate = edge_tts.Communicate(
@@ -381,7 +366,6 @@ class ItalianTTSEngine:
             except Exception as e:
                 logging.warning(f"Edge-TTS fallito ({e}), passo al fallback gTTS...")
 
-        # 2. Fallback automatico su Google TTS (gTTS) in italiano
         if HAS_GTTS:
             try:
                 loop = asyncio.get_running_loop()
@@ -400,15 +384,13 @@ class ItalianTTSEngine:
 
 
 class ItalianDiscordAudioSource(sr.AudioSource):
-    """
-    AudioSource ottimizzata per Discord a 48kHz stereo -> mono senza clipping.
-    """
+    """Mantenuta per compatibilità con test unitari stereo->mono."""
 
     little_endian = True
     SAMPLE_RATE = 48_000
     SAMPLE_WIDTH = 2
     CHANNELS = 2
-    CHUNK = 960  # 20ms a 48kHz
+    CHUNK = 960
 
     def __init__(self, buffer: array.array):
         self.buffer = buffer
@@ -427,26 +409,13 @@ class ItalianDiscordAudioSource(sr.AudioSource):
 
     def read(self, size: int) -> bytes:
         bytes_needed = size * self.CHANNELS * self.SAMPLE_WIDTH
-
-        for _ in range(9):
-            if len(self.buffer) < bytes_needed:
-                time.sleep(0.05)
-            else:
-                break
-        else:
-            if len(self.buffer) < 4:
-                return b""
-
         available = min(bytes_needed, len(self.buffer))
         aligned = available - (available % 4)
         if aligned <= 0:
             return b""
-
         audiochunk = self.buffer[:aligned].tobytes()
         del self.buffer[:aligned]
-
-        mono_chunk = audioop.tomono(audiochunk, self.SAMPLE_WIDTH, 0.5, 0.5)
-        return mono_chunk
+        return audioop.tomono(audiochunk, self.SAMPLE_WIDTH, 0.5, 0.5)
 
     def close(self) -> None:
         del self.buffer[:]
@@ -454,8 +423,18 @@ class ItalianDiscordAudioSource(sr.AudioSource):
 
 class ItalianSpeechSink(voice_recv.AudioSink):
     """
-    Sink vocale Discord progettato per riconoscere con alta precisione l'italiano.
+    Sink vocale Discord con raccoglitore di frasi (Utterance Collector) per-utente:
+    - Accumula i pacchetti PCM di ciascun utente finché l'utente non fa una vera pausa
+      di fine frase (1.15 secondi di silenzio), evitando di spezzare "Venus... metti [canzone]"
+      in due tronconi separati!
+    - Usa Groq Whisper Large v3 Turbo con prompt bilingue (Italiano + titoli canzoni Inglesi)
+      e Google Speech Recognition (it-IT + supporto en-US per i titoli) in fallback.
     """
+
+    SAMPLE_RATE = 48_000
+    SAMPLE_WIDTH = 2
+    SILENCE_FLUSH_SECONDS = 1.15   # Attende 1.15s di silenzio prima di considerare conclusa la frase
+    MAX_PHRASE_SECONDS = 12.0      # Durata massima singola frase
 
     def __init__(
         self,
@@ -468,66 +447,101 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         self.phrase_time_limit = phrase_time_limit
         self.language = language
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip().strip("'\"")
-        self._stream_data: Dict[int, Dict[str, Any]] = defaultdict(self._create_user_stream)
 
-    @staticmethod
-    def _create_user_stream() -> Dict[str, Any]:
-        recognizer = sr.Recognizer()
-        recognizer.energy_threshold = 220
-        recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold = 0.65
-        recognizer.phrase_threshold = 0.2
-        recognizer.non_speaking_duration = 0.3
-        return {
-            "stopper": None,
-            "recognizer": recognizer,
-            "buffer": array.array("B"),
-        }
+        self._lock = threading.Lock()
+        self._user_buffers: Dict[int, Dict[str, Any]] = {}
+        self._recognizer = sr.Recognizer()
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="stt-worker")
+        self._running = True
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop, daemon=True, name="italian-speech-flusher"
+        )
+        self._flush_thread.start()
 
     def wants_opus(self) -> bool:
         return False
 
     def write(self, user: Optional[discord.Member], data: voice_recv.VoiceData) -> None:
+        if not self._running:
+            return
         if isinstance(data.packet, SilencePacket):
             return
         if user is None or getattr(user, "bot", False):
             return
+        if not data.pcm or len(data.pcm) < 4:
+            return
 
-        sdata = self._stream_data[user.id]
-        sdata["buffer"].extend(data.pcm)
+        # Allinea a 4 byte (stereo 16-bit) e converti in mono senza clipping (0.5, 0.5)
+        aligned_len = len(data.pcm) - (len(data.pcm) % 4)
+        if aligned_len <= 0:
+            return
+        mono_pcm = audioop.tomono(data.pcm[:aligned_len], self.SAMPLE_WIDTH, 0.5, 0.5)
 
-        if not sdata["stopper"]:
-            source = ItalianDiscordAudioSource(sdata["buffer"])
-            sdata["stopper"] = sdata["recognizer"].listen_in_background(
-                source,
-                self._make_background_callback(user),
-                phrase_time_limit=self.phrase_time_limit,
-            )
+        # Ignora puro silenzio digitale iniziale
+        rms = audioop.rms(mono_pcm, self.SAMPLE_WIDTH)
+        now = time.monotonic()
 
-    def _make_background_callback(self, user: discord.Member):
-        def callback(recognizer: sr.Recognizer, audio: sr.AudioData):
-            text = self._recognize_italian(recognizer, audio)
+        with self._lock:
+            entry = self._user_buffers.get(user.id)
+            if entry is None:
+                if rms < 100:
+                    return
+                entry = {
+                    "user": user,
+                    "pcm": bytearray(),
+                    "first_ts": now,
+                    "last_ts": now,
+                }
+                self._user_buffers[user.id] = entry
+
+            entry["user"] = user
+            entry["pcm"].extend(mono_pcm)
+            if rms >= 90:
+                entry["last_ts"] = now
+
+    def _flush_loop(self) -> None:
+        while self._running:
+            time.sleep(0.10)
+            now = time.monotonic()
+            to_process = []
+
+            with self._lock:
+                for uid, entry in list(self._user_buffers.items()):
+                    silence_elapsed = now - entry["last_ts"]
+                    total_elapsed = now - entry["first_ts"]
+                    if (
+                        silence_elapsed >= self.SILENCE_FLUSH_SECONDS
+                        or total_elapsed >= self.MAX_PHRASE_SECONDS
+                    ):
+                        self._user_buffers.pop(uid, None)
+                        to_process.append((entry["user"], bytes(entry["pcm"])))
+
+            for user, pcm_bytes in to_process:
+                self._executor.submit(self._process_utterance, user, pcm_bytes)
+
+    def _process_utterance(self, user: discord.Member, pcm_bytes: bytes) -> None:
+        try:
+            duration_sec = len(pcm_bytes) / (self.SAMPLE_RATE * self.SAMPLE_WIDTH)
+            if duration_sec < 0.35:
+                return
+            if audioop.rms(pcm_bytes, self.SAMPLE_WIDTH) < 110:
+                return
+
+            audio = sr.AudioData(pcm_bytes, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
+            text = self._recognize_italian(self._recognizer, audio)
             if text and text.strip():
                 self.on_transcription(user, text.strip())
-
-        return callback
+        except Exception as e:
+            logging.debug(f"Errore elaborazione frase vocale: {e}")
 
     def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
-        try:
-            raw_bytes = audio.frame_data
-            duration_sec = len(raw_bytes) / (audio.sample_rate * audio.sample_width)
-            if duration_sec < 0.25:
-                return None
-            if audioop.rms(raw_bytes, audio.sample_width) < 120:
-                return None
-        except Exception:
-            pass
-
+        # 1. Prova Groq Whisper Cloud con prompt bilingue (italiano + titoli musicali in inglese)
         if self.groq_api_key:
             whisper_text = self._recognize_with_groq_whisper(audio)
             if whisper_text:
                 return whisper_text
 
+        # 2. Fallback Google Speech Recognition (it-IT)
         try:
             func = getattr(recognizer, "recognize_google", None)
             if func:
@@ -555,6 +569,13 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             ["whisper-large-v3-turbo", "whisper-large-v3"],
         )
 
+        # Prompt che guida Whisper a riconoscere comandi italiani + titoli di canzoni in inglese e italiano
+        bilingual_prompt = (
+            "Venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume. "
+            "Richieste vocali in italiano e titoli di canzoni o artisti in inglese e italiano "
+            "(es. Blinding Lights, The Weeknd, Bohemian Rhapsody, Queen, Eminem, Travis Scott, Drake, Linkin Park, Geolier, Vasco Rossi)."
+        )
+
         try:
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
             for w_model in list(whisper_models):
@@ -565,6 +586,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     data={
                         "model": w_model,
                         "language": "it",
+                        "prompt": bilingual_prompt,
                         "response_format": "json",
                         "temperature": "0.0",
                     },
@@ -577,9 +599,10 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                         "sottotitoli creati dalla comunità amara.org",
                         "sottotitoli e revisione a cura di",
                         "grazie per aver guardato",
+                        "venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume.",
                         "...",
                     }
-                    if text.lower() in hallucinations:
+                    if not text or text.lower() in hallucinations:
                         return None
                     return text
                 elif resp.status_code in (403, 404):
@@ -598,22 +621,14 @@ class ItalianSpeechSink(voice_recv.AudioSink):
     @voice_recv.AudioSink.listener()
     def on_voice_member_disconnect(self, member: discord.Member, ssrc: Optional[int]) -> None:
         if member is not None:
-            self._drop(member.id)
+            with self._lock:
+                self._user_buffers.pop(member.id, None)
 
     def cleanup(self) -> None:
-        for user_id in tuple(self._stream_data.keys()):
-            self._drop(user_id)
-
-    def _drop(self, user_id: int) -> None:
-        data = self._stream_data.pop(user_id, None)
-        if not data:
-            return
-        stopper = data.get("stopper")
-        if stopper:
-            try:
-                stopper(False)
-            except Exception:
-                pass
-        buf = data.get("buffer")
-        if buf is not None:
-            del buf[:]
+        self._running = False
+        with self._lock:
+            self._user_buffers.clear()
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass

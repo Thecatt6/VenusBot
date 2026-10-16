@@ -35,6 +35,76 @@ def _clean_title(title: str) -> str:
     return cleaned or title.strip()
 
 
+# Parole tipiche di video di YouTuber / Gameplay / Vlog da escludere quando si cerca musica
+NON_MUSIC_BLACKLIST = (
+    "gameplay",
+    "walkthrough",
+    "let's play",
+    "lets play",
+    "vlog",
+    "reaction",
+    "reazione",
+    "episodio",
+    "minecraft",
+    "fortnite",
+    "roblox",
+    "gta",
+    "brawl stars",
+    "clash royale",
+    "recensione",
+    "tutorial",
+    "unboxing",
+    "intervista",
+    "podcast",
+    "telecronaca",
+    "highlights",
+    "challenge",
+    "prank",
+    "scherzo",
+)
+
+
+def _score_music_candidate(entry: dict, original_query: str) -> int:
+    """
+    Calcola un punteggio per distinguere un vero brano musicale da un video di YouTuber.
+    Restituisce un punteggio negativo se il video non è musicale.
+    """
+    title = (entry.get("title") or "").lower()
+    channel = (entry.get("channel") or entry.get("uploader") or "").lower()
+    duration = int(entry.get("duration") or 0)
+    query_lower = original_query.lower()
+
+    # Escludi video troppo corti (< 35s, es. Shorts/Meme) o troppo lunghi (> 12 min, es. Vlog/Gameplay)
+    if duration > 0 and (duration < 35 or duration > 720):
+        return -100
+
+    # Escludi parole da YouTuber/Gameplay a meno che non siano esplicitamente nella query
+    for bad_word in NON_MUSIC_BLACKLIST:
+        if bad_word in title and bad_word not in query_lower:
+            return -100
+
+    score = 0
+    # Canali ufficiali di YouTube Music ("Artista - Topic") o VEVO hanno priorità assoluta
+    if "- topic" in channel or "vevo" in channel:
+        score += 50
+    if "official" in channel or "records" in channel or "music" in channel:
+        score += 20
+
+    # Titoli tipici di tracce musicali
+    if "official audio" in title or "audio ufficiale" in title:
+        score += 35
+    elif "lyrics" in title or "testo" in title or "lyric video" in title:
+        score += 25
+    elif "official video" in title or "video ufficiale" in title or "official music video" in title:
+        score += 20
+
+    # Durata tipica di una canzone (1m30s - 6m00s)
+    if 90 <= duration <= 360:
+        score += 15
+
+    return score
+
+
 class VideoSearcher:
     def __init__(self):
         root_dir = Path(__file__).resolve().parent.parent
@@ -50,29 +120,80 @@ class VideoSearcher:
             "cachedir": False,
             "nocheckcertificate": True,
             "geo_bypass": True,
+            "source_address": "0.0.0.0",  # Forza IPv4 per evitare Read Timeout su googlevideo.com in Docker
+            "socket_timeout": 8,
+            "retries": 2,
+            "fragment_retries": 2,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android_vr", "ios", "tv", "web"],
+                }
+            },
         }
-        # Usa cookies.txt solo se esiste ed è effettivamente popolato
         if self.cookies_path.exists() and self.cookies_path.stat().st_size > 32:
             opts["cookiefile"] = str(self.cookies_path)
         return opts
 
+    def _select_best_music_url(self, query: str) -> str:
+        """
+        Cerca su YouTube filtrando esclusivamente brani musicali (Topic, VEVO, Official Audio)
+        ed escludendo video di YouTuber, gameplay o vlog.
+        """
+        search_query = query
+        if not any(
+            w in query.lower()
+            for w in ("official", "audio", "lyrics", "song", "canzone", "brano")
+        ):
+            search_query = f"{query} official audio"
+
+        flat_opts = {
+            **self._get_base_options(),
+            "noplaylist": True,
+            "extract_flat": "in_playlist",
+            "default_search": "ytsearch6",
+            "ignoreerrors": True,
+        }
+        try:
+            with YoutubeDL(flat_opts) as ytdlp:
+                info = ytdlp.extract_info(search_query, download=False)
+                entries = [e for e in (info.get("entries") or []) if e] if info else []
+                if entries:
+                    scored = sorted(
+                        entries,
+                        key=lambda e: _score_music_candidate(e, query),
+                        reverse=True,
+                    )
+                    best = scored[0]
+                    raw_url = best.get("url") or best.get("webpage_url") or best.get("id")
+                    if raw_url:
+                        if not str(raw_url).startswith("http"):
+                            raw_url = f"https://www.youtube.com/watch?v={raw_url}"
+                        logging.info(
+                            f"[Filtro Musica] Scelto brano: '{best.get('title')}' "
+                            f"(canale: {best.get('channel') or best.get('uploader')})"
+                        )
+                        return raw_url
+        except Exception as e:
+            logging.debug(f"Ricerca selettiva musicale fallback: {e}")
+
+        return f"ytsearch1:{search_query}"
+
     def _download_or_extract(self, target: str, is_search: bool = False) -> Optional[dict]:
         """
-        Estrae le informazioni del brano e, per i brani non-live di durata <= 30 minuti,
-        scarica direttamente il flusso audio tramite il downloader interno di yt-dlp
-        (evitando qualsiasi errore HTTP 403 Forbidden di FFmpeg su googlevideo.com).
-        Per le live stream (es. radio /lofi) restituisce l'URL di stream + gli header HTTP.
+        Estrae e scarica rapidamente la traccia audio con IPv4 forzato e client anti-403.
         """
-        base_opts = {
+        resolved_target = self._select_best_music_url(target) if is_search else target
+
+        file_token = uuid.uuid4().hex[:12]
+        outtmpl = str(self.cache_dir / f"track_{file_token}.%(ext)s")
+
+        # 1. Estrai metadati rapidi per capire se è una live stream (es. /lofi) o una canzone
+        meta_opts = {
             **self._get_base_options(),
             "noplaylist": True,
         }
-        if is_search:
-            base_opts["default_search"] = "ytsearch"
-
-        # 1. Estrai metadati senza scaricare per verificare se è live o un brano standard
-        with YoutubeDL(base_opts) as ytdlp:
-            info = ytdlp.extract_info(target, download=False)
+        with YoutubeDL(meta_opts) as ytdlp:
+            info = ytdlp.extract_info(resolved_target, download=False)
             if not info:
                 return None
             if "entries" in info:
@@ -85,13 +206,11 @@ class VideoSearcher:
 
         duration = int(video.get("duration") or 0)
         is_live = bool(video.get("is_live")) or duration == 0
-        webpage_url = video.get("webpage_url") or video.get("url") or target
+        webpage_url = video.get("webpage_url") or video.get("url") or resolved_target
         headers = video.get("http_headers") or {}
 
-        # 2. Se è un brano standard (non live, <= 30 min), scaricalo in cache locale con yt-dlp
-        if not is_live and 0 < duration <= 1800:
-            file_token = uuid.uuid4().hex[:12]
-            outtmpl = str(self.cache_dir / f"track_{file_token}.%(ext)s")
+        # 2. Se è una canzone standard (non live, <= 20 min), scaricala in locale con IPv4
+        if not is_live and 0 < duration <= 1200:
             dl_opts = {
                 **self._get_base_options(),
                 "noplaylist": True,
@@ -114,7 +233,7 @@ class VideoSearcher:
                             "is_local_cache": True,
                         }
             except Exception as e:
-                logging.warning(f"Download diretto yt-dlp fallito ({e}), uso stream URL con headers...")
+                logging.warning(f"Download rapido fallito ({e}), uso stream diretto...")
 
         return {
             "title": _clean_title(video.get("title", "")),
@@ -146,13 +265,15 @@ class VideoSearcher:
                 "extract_flat": "in_playlist",
             }
             with YoutubeDL(yt_dlp_options) as ytdlp:
-                info = ytdlp.extract_info(video_query, download=False)
+                info = ytdlp.extract_info(f"{video_query} official audio", download=False)
                 if not info:
                     return []
                 entries = info.get("entries") if "entries" in info else [info]
                 results = []
                 for entry in entries or []:
                     if not entry:
+                        continue
+                    if _score_music_candidate(entry, video_query) < 0:
                         continue
                     raw_link = entry.get("url") or entry.get("webpage_url") or entry.get("id")
                     if not raw_link:

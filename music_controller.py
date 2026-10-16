@@ -82,6 +82,7 @@ class MusicController:
 
         self.current_audio_source: Optional[InterruptibleOpusSource] = None
         self._tts_lock = asyncio.Lock()
+        self._active_listener_until: dict[int, float] = {}
 
     def _bot_avatar_url(self) -> Optional[str]:
         if self.client.user:
@@ -198,7 +199,7 @@ class MusicController:
                 tts_opus = discord.FFmpegOpusAudio(
                     str(tts_file),
                     before_options="-loglevel error",
-                    options='-vn -filter:a "volume=1.15"',
+                    options='-vn -loglevel error -filter:a "volume=1.15"',
                 )
 
                 done_event = asyncio.Event()
@@ -489,6 +490,15 @@ class MusicController:
 
         kw_manager = BotKeywords()
         activated, matched_wake, remainder = await kw_manager.extractCommandAfterWakeWord(text)
+
+        # Controlla se l'utente è nella finestra di ascolto attivo (8 secondi dopo aver detto solo "Venus")
+        now_mono = time.monotonic()
+        if not activated and self._active_listener_until.get(user.id, 0.0) > now_mono:
+            activated = True
+            matched_wake = "followup"
+            remainder = text.strip()
+            self._active_listener_until.pop(user.id, None)
+
         if not activated:
             return
 
@@ -518,6 +528,11 @@ class MusicController:
         action = resp.action
         query = resp.query
         voice_reply = resp.voice_reply
+
+        if action == "listen_followup":
+            await self.speakInVC(voice_reply or "Dimmi pure.")
+            self._active_listener_until[user.id] = time.monotonic() + 8.0
+            return
 
         if action == "none":
             await self.speakInVC(voice_reply)
@@ -933,7 +948,7 @@ class MusicController:
 
         ffmpeg_options = {
             "before_options": self._build_ffmpeg_before_options(song),
-            "options": f'-vn -filter:a "volume={self.volume:.2f}"',
+            "options": f'-vn -loglevel error -filter:a "volume={self.volume:.2f}"',
         }
 
         raw_player = discord.FFmpegOpusAudio(song.link, **ffmpeg_options)
