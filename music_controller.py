@@ -1,23 +1,41 @@
-import discord
-import os
-import re
 import asyncio
-import time
-import random
-from discord import app_commands
-from discord.ext import commands, voice_recv
-from typing import Optional, Tuple
-import speech_recognition as sr
 import logging
-from management.banned_users import BannedUsers
-from management.word_counter import WordCounter
-from management.bot_keywords import BotKeywords
-from scripts.ytDLP import VideoSearcher, getSongExpiration
+import os
+import random
+import re
+import time
+from pathlib import Path
+from typing import Optional, Tuple
+
+import discord
+from discord.ext import voice_recv
+
 from embed_views.music_buttons import MusicButtons
+from management.banned_users import BannedUsers
+from management.bot_keywords import BotKeywords
+from management.word_counter import WordCounter
+from scripts.ai_assistant import AIAssistant
 from scripts.spotify import SpotifyController
+from scripts.voice_engine import (
+    ITALIAN_TTS_VOICES,
+    InterruptibleOpusSource,
+    ItalianSpeechSink,
+    ItalianTTSEngine,
+)
+from scripts.ytDLP import VideoSearcher, getSongExpiration
+
 
 class Song:
-    def __init__(self, title: str, url: str, link: str, thumbnail: str, duration: int, user: discord.User, isFile: bool):
+    def __init__(
+        self,
+        title: str,
+        url: str,
+        link: str,
+        thumbnail: Optional[str],
+        duration: int,
+        user: discord.User,
+        isFile: bool,
+    ):
         self.title = title
         self.url = url
         self.link = link
@@ -26,174 +44,264 @@ class Song:
         self.user = user
         self.isFile = isFile
 
+
 class MusicController:
-    # Constructor
     def __init__(self, client: discord.Client, guild: discord.Guild):
-        logging.info(f"Created Music Controller for: {guild}")
+        logging.info(f"Creato MusicController per il server: {guild.name} ({guild.id})")
         self.client = client
         self.guild = guild
         self.spotify = SpotifyController()
-        # self.loop = asyncio.get_running_loop() # apparently not necessary, use self.client.loop
-        self.voiceChannel = None
-        self.textChannel = None
-        self.transcriptionChannel = None
-        self.songQueue = []
-        self.isLooping = False
-        self.isMajorityVote = False
-        self.start_time = None
-        self.pause_start = None
-        self.pause_duration = 0
+        self.ai_assistant = AIAssistant()
+        self.tts_engine = ItalianTTSEngine()
 
-    # function to check if the bot is currently connected to a voice channel
-    def isConnectedToVC(self):
+        self.voiceChannel: Optional[discord.VoiceChannel] = None
+        self.textChannel: Optional[discord.TextChannel] = None
+        self.transcriptionChannel: Optional[discord.TextChannel] = None
+
+        self.songQueue: list[Song] = []
+        self.isLooping: bool = False
+        self.isMajorityVote: bool = False
+        self.volume: float = 0.70
+
+        self.start_time: Optional[int] = None
+        self.pause_start: Optional[int] = None
+        self.pause_duration: int = 0
+
+        self.current_audio_source: Optional[InterruptibleOpusSource] = None
+        self._tts_lock = asyncio.Lock()
+        self._suppress_after_callback: bool = False
+
+    def _bot_avatar_url(self) -> Optional[str]:
+        if self.client.user:
+            return self.client.user.display_avatar.url
+        return None
+
+    def isConnectedToVC(self) -> bool:
         voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-        if voice_client and voice_client.is_connected():
-            logging.debug(f"{self.guild.name} Music Controller is connected to a voice channel.")
-            return True
-        else:
-            logging.debug(f"{self.guild.name} Music Controller is not connected to any voice channel.")
-            return False
-        
-    # function to get the voice and text channel
-    def getVideoAndTextChannel(self) -> Tuple[discord.VoiceChannel, discord.TextChannel]:
+        return bool(voice_client and voice_client.is_connected())
+
+    def getVideoAndTextChannel(self) -> Tuple[Optional[discord.VoiceChannel], Optional[discord.TextChannel]]:
         return self.voiceChannel, self.textChannel
-    
-    # function to get the song queue
-    def getSongQueue(self) -> list:
+
+    def getSongQueue(self) -> list[Song]:
         return self.songQueue
-    
-    # function to get isMajorityVote
+
     def getIsMajorityVote(self) -> bool:
         return self.isMajorityVote
-    
+
+    def setVolume(self, volume_percent: int) -> int:
+        clamped = max(5, min(150, int(volume_percent)))
+        self.volume = clamped / 100.0
+        return clamped
+
+    def setTTSVoice(self, voice_name: str) -> str:
+        return self.tts_engine.set_voice(voice_name)
+
     async def getCurrentDuration(self) -> str:
         def format_duration(seconds: int) -> str:
+            seconds = max(0, int(seconds))
             hours, remainder = divmod(seconds, 3600)
             minutes, secs = divmod(remainder, 60)
             if hours > 0:
                 return f"{hours:02}:{minutes:02}:{secs:02}"
-            else:
-                return f"{minutes:02}:{secs:02}"
-            
-        if self.songQueue:
-            songDuration = self.songQueue[0].duration
+            return f"{minutes:02}:{secs:02}"
+
+        if self.songQueue and self.start_time is not None:
+            song_duration = self.songQueue[0].duration
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            if voice_client.is_paused():
-                start = int(self.pause_start - self.start_time - self.pause_duration)
-                if songDuration == 0:
-                    return f"*{format_duration(start)}* into the stream."
-                return f"*{format_duration(start)}* **/** *{format_duration(songDuration)}*"
-            start = int(int(time.time()) - self.start_time - self.pause_duration)
-            if songDuration == 0:
-                return f"*{format_duration(start)}* into the stream."
-            return f"*{format_duration(start)}* **/** *{format_duration(songDuration)}*"
-        return "No song is currently being played."
-        
-    # function to set the transcription channel
-    async def setTranscriptionChannel(self, transcriptionChannel: discord.TextChannel) -> discord.TextChannel:
-        logging.debug("Starting /transcribe function")        
-        self.transcriptionChannel = transcriptionChannel      
+            if voice_client and voice_client.is_paused() and self.pause_start is not None:
+                elapsed = int(self.pause_start - self.start_time - self.pause_duration)
+            else:
+                elapsed = int(time.time() - self.start_time - self.pause_duration)
+            elapsed = max(0, elapsed)
+            if song_duration == 0:
+                return f"*{format_duration(elapsed)}* in riproduzione (stream live)."
+            return f"*{format_duration(elapsed)}* **/** *{format_duration(song_duration)}*"
+        return "Nessun brano attualmente in riproduzione."
+
+    async def setTranscriptionChannel(
+        self, transcriptionChannel: Optional[discord.TextChannel]
+    ) -> Optional[discord.TextChannel]:
+        self.transcriptionChannel = transcriptionChannel
         return self.transcriptionChannel
-    
-    # function to set looping
+
     async def setLooping(self) -> bool:
-        logging.debug("Starting /loop function")        
         self.isLooping = not self.isLooping
         return self.isLooping
-    
-    # function to set majority vote
+
     async def setMajorityVote(self) -> bool:
-        logging.debug("Starting /majorvote function")        
         self.isMajorityVote = not self.isMajorityVote
         return self.isMajorityVote
-    
-    # function to skip current song
+
     async def shuffleQueue(self):
-        logging.debug("Starting /shuffle function")   
-        if self.isConnectedToVC():
-            if len(self.songQueue) <= 1:
-                return
-            # Preserve the first song
+        if self.isConnectedToVC() and len(self.songQueue) > 1:
             first_song = self.songQueue[0]
             rest = self.songQueue[1:]
-            # Shuffle the remaining songs
             random.shuffle(rest)
-            # Reassign the shuffled list back to the queue
             self.songQueue[:] = [first_song] + rest
-        return
-    
+
     async def searchSongs(self, query: str):
-        logging.debug("Starting /search function")
-        # get the video searcher class
         searcher = VideoSearcher()
         try:
             result = await searcher.getSearchResults(query)
         except Exception as e:
-            logging.error(e)
-            await self.textChannel.send(f"Unable to search for songs: {e}")
-            return
-        # check if result came back successfully
+            logging.error(f"Errore ricerca brani: {e}")
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile cercare il brano: {e}")
+            return None
         if not result:
-            await self.textChannel.send(f"Unable to search for songs: {e}")
-            return
+            if self.textChannel:
+                await self.textChannel.send("❌ Nessun risultato trovato su YouTube.")
+            return None
         return result
 
-    
-    # function to skip current song
-    async def skipSong(self, message: discord.Message = None):
-        logging.debug("Starting /skip function")   
-        if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            if not self.isMajorityVote:
-                voice_client.stop_playing()
-                return
-            
-            if not message:
-                message = await self.textChannel.send(f"Skip the Song?")
-            
-            await message.add_reaction("✅")
-            await message.add_reaction("❌")
+    async def speakInVC(self, text: str) -> None:
+        """
+        Pronuncia il testo in italiano direttamente nel canale vocale (modalità Solo Voce):
+        - Se c'è musica in riproduzione, la mette temporaneamente in pausa tramite InterruptibleOpusSource,
+          parla e poi riprende la canzone dal punto esatto in cui si era fermata.
+        - Se non c'è musica in riproduzione, riproduce direttamente l'audio TTS sul voice_client.
+        """
+        if not text or not text.strip():
+            return
+        if not self.isConnectedToVC():
+            return
 
-            def check(reaction, user):
-                return (
-                    reaction.message.id == message.id and
-                    str(reaction.emoji) in ["✅", "❌"] and
-                    user in voice_client.channel.members and not user.bot
+        async with self._tts_lock:
+            tts_file: Optional[Path] = None
+            try:
+                tts_file = await self.tts_engine.synthesize_to_file(text)
+                if not tts_file or not tts_file.exists():
+                    return
+
+                voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+                if not voice_client or not voice_client.is_connected():
+                    return
+
+                tts_opus = discord.FFmpegOpusAudio(
+                    str(tts_file),
+                    options='-vn -filter:a "volume=1.15"',
                 )
 
-            eligible_users = [m for m in voice_client.channel.members if not m.bot]
-            required_votes = (len(eligible_users) // 2) + 1
-            logging.debug(f"required votes: {required_votes}")
+                done_event = asyncio.Event()
+                loop = self.client.loop
 
-            vote_counts = {"✅": 0, "❌": 0}
-            voters = set()
+                # Caso 1: Musica attiva o in pausa gestita da InterruptibleOpusSource
+                if (
+                    (voice_client.is_playing() or voice_client.is_paused())
+                    and self.current_audio_source is not None
+                ):
+                    was_paused = voice_client.is_paused()
 
-            try:
-                while True:
-                    reaction, user = await self.client.wait_for("reaction_add", timeout=30, check=check)
-                    if user.id in voters:
-                        continue
-                    vote_counts[str(reaction.emoji)] += 1
-                    voters.add(user.id)
+                    def _on_tts_end(elapsed_sec: float):
+                        if not was_paused:
+                            self.pause_duration += int(round(elapsed_sec))
+                        else:
+                            try:
+                                voice_client.pause()
+                            except Exception:
+                                pass
+                        loop.call_soon_threadsafe(done_event.set)
 
-                    if vote_counts["✅"] >= required_votes:
-                        await self.textChannel.send("Majority vote reached. Skipping song.")
+                    self.current_audio_source.interrupt_with(tts_opus, on_end=_on_tts_end)
+                    if was_paused:
+                        voice_client.resume()
+
+                    try:
+                        await asyncio.wait_for(done_event.wait(), timeout=45.0)
+                    except asyncio.TimeoutError:
+                        self.current_audio_source.cancel_interrupt()
+
+                # Caso 2: Nessuna canzone in riproduzione
+                else:
+                    def _after_standalone_tts(error):
+                        if error:
+                            logging.debug(f"Errore riproduzione TTS: {error}")
+                        loop.call_soon_threadsafe(done_event.set)
+
+                    if not voice_client.is_playing():
+                        voice_client.play(tts_opus, after=_after_standalone_tts)
+                        try:
+                            await asyncio.wait_for(done_event.wait(), timeout=45.0)
+                        except asyncio.TimeoutError:
+                            if hasattr(voice_client, "stop_playing"):
+                                voice_client.stop_playing()
+                            else:
+                                voice_client.stop()
+            except Exception as e:
+                logging.error(f"Errore in speakInVC: {e}")
+            finally:
+                if tts_file and tts_file.exists():
+                    try:
+                        tts_file.unlink()
+                    except Exception:
+                        pass
+
+    async def skipSong(self, message: discord.Message = None):
+        if not self.isConnectedToVC():
+            return
+        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+        if not self.isMajorityVote:
+            if self.current_audio_source:
+                self.current_audio_source.cancel_interrupt()
+            if hasattr(voice_client, "stop_playing"):
+                voice_client.stop_playing()
+            else:
+                voice_client.stop()
+            return
+
+        if not message and self.textChannel:
+            message = await self.textChannel.send("⏭️ Saltare la canzone corrente? Vota qui sotto:")
+
+        if not message:
+            return
+
+        await message.add_reaction("✅")
+        await message.add_reaction("❌")
+
+        def check(reaction, user):
+            return (
+                reaction.message.id == message.id
+                and str(reaction.emoji) in ["✅", "❌"]
+                and user in voice_client.channel.members
+                and not user.bot
+            )
+
+        eligible_users = [m for m in voice_client.channel.members if not m.bot]
+        required_votes = (len(eligible_users) // 2) + 1
+
+        vote_counts = {"✅": 0, "❌": 0}
+        voters = set()
+
+        try:
+            while True:
+                reaction, user = await self.client.wait_for("reaction_add", timeout=30, check=check)
+                if user.id in voters:
+                    continue
+                vote_counts[str(reaction.emoji)] += 1
+                voters.add(user.id)
+
+                if vote_counts["✅"] >= required_votes:
+                    if self.textChannel:
+                        await self.textChannel.send("✅ Maggioranza raggiunta. Salto il brano.")
+                    if hasattr(voice_client, "stop_playing"):
                         voice_client.stop_playing()
-                        return
-                    elif vote_counts["❌"] >= required_votes:
-                        await self.textChannel.send("Majority vote reached. Song will continue playing.")
-                        return
-                    elif len(voters) == len(eligible_users):
-                        await self.textChannel.send("No Majority was found. Song will continue playing.")
-                        return
-            except asyncio.TimeoutError:
-                await self.textChannel.send("Vote timed out. Song will continue playing.")
-            
+                    else:
+                        voice_client.stop()
+                    return
+                elif vote_counts["❌"] >= required_votes:
+                    if self.textChannel:
+                        await self.textChannel.send("❌ Maggioranza contraria. Il brano continua.")
+                    return
+                elif len(voters) >= len(eligible_users):
+                    if self.textChannel:
+                        await self.textChannel.send("ℹ️ Nessuna maggioranza raggiunta. Il brano continua.")
+                    return
+        except asyncio.TimeoutError:
+            if self.textChannel:
+                await self.textChannel.send("⌛ Tempo per votare scaduto. Il brano continua.")
 
-    
-    # function to pause current song
-    async def pauseSong(self):
-        logging.debug("Starting /pause function")   
+    async def pauseSong(self) -> bool:
         if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
             if not voice_client.is_paused():
@@ -202,607 +310,667 @@ class MusicController:
                 return True
             else:
                 voice_client.resume()
-                self.pause_duration += int(time.time()) - self.pause_start
+                if self.pause_start is not None:
+                    self.pause_duration += int(time.time()) - self.pause_start
+                    self.pause_start = None
                 return False
-    
-    # function to resume current song
+        return False
+
     async def resumeSong(self):
-        logging.debug("Starting /resume function")   
         if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
             if voice_client.is_paused():
                 voice_client.resume()
-                self.pause_duration += int(time.time()) - self.pause_start
-        return
-    
-    # function to stop all songs
+                if self.pause_start is not None:
+                    self.pause_duration += int(time.time()) - self.pause_start
+                    self.pause_start = None
+
     async def stopAllSongs(self, message: discord.Message = None):
-        logging.debug("Starting /stop function")   
+        if not self.isConnectedToVC():
+            return
+        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+        if not self.isMajorityVote:
+            self.songQueue.clear()
+            self.isLooping = False
+            if self.current_audio_source:
+                self.current_audio_source.cancel_interrupt()
+            if hasattr(voice_client, "stop_playing"):
+                voice_client.stop_playing()
+            else:
+                voice_client.stop()
+            return
+
+        if not message and self.textChannel:
+            message = await self.textChannel.send(
+                "⏹️ Fermare la musica e svuotare la coda? ***Richiede il voto di tutti***"
+            )
+        if not message:
+            return
+
+        await message.add_reaction("✅")
+        await message.add_reaction("❌")
+
+        def check(reaction, user):
+            return (
+                reaction.message.id == message.id
+                and str(reaction.emoji) in ["✅", "❌"]
+                and user in voice_client.channel.members
+                and not user.bot
+            )
+
+        eligible_users = [m for m in voice_client.channel.members if not m.bot]
+        required_votes = max(1, len(eligible_users))
+
+        vote_counts = {"✅": 0, "❌": 0}
+        voters = set()
+
+        try:
+            while True:
+                reaction, user = await self.client.wait_for("reaction_add", timeout=45, check=check)
+                if user.id in voters:
+                    continue
+                vote_counts[str(reaction.emoji)] += 1
+                voters.add(user.id)
+
+                if vote_counts["✅"] >= required_votes:
+                    if self.textChannel:
+                        await self.textChannel.send("⏹️ Votazione approvata. Fermo la musica e svuoto la coda.")
+                    self.songQueue.clear()
+                    self.isLooping = False
+                    if hasattr(voice_client, "stop_playing"):
+                        voice_client.stop_playing()
+                    else:
+                        voice_client.stop()
+                    return
+                elif vote_counts["❌"] >= required_votes:
+                    if self.textChannel:
+                        await self.textChannel.send("❌ Votazione respinta. La riproduzione continua.")
+                    return
+                elif len(voters) >= len(eligible_users):
+                    if self.textChannel:
+                        await self.textChannel.send("ℹ️ Nessuna unanimità raggiunta. La riproduzione continua.")
+                    return
+        except asyncio.TimeoutError:
+            if self.textChannel:
+                await self.textChannel.send("⌛ Tempo per votare scaduto. La riproduzione continua.")
+
+    async def softDisconnect(self):
         if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            if not self.isMajorityVote:
-                self.songQueue = []
-                self.isLooping = False
-                voice_client.stop_playing()
-                return
-            
-            if not message:
-                message = await self.textChannel.send(f"Stop current song and clear the queue? ***Needs all votes***")
-            
-            await message.add_reaction("✅")
-            await message.add_reaction("❌")
-
-            def check(reaction, user):
-                return (
-                    reaction.message.id == message.id and
-                    str(reaction.emoji) in ["✅", "❌"] and
-                    user in voice_client.channel.members and not user.bot
-                )
-
-            eligible_users = [m for m in voice_client.channel.members if not m.bot]
-            required_votes = (len(eligible_users))
-            logging.debug(f"required votes: {required_votes}")
-
-            vote_counts = {"✅": 0, "❌": 0}
-            voters = set()
-
-            try:
-                while True:
-                    reaction, user = await self.client.wait_for("reaction_add", timeout=45, check=check)
-                    if user.id in voters:
-                        continue
-                    vote_counts[str(reaction.emoji)] += 1
-                    voters.add(user.id)
-
-                    if vote_counts["✅"] >= required_votes:
-                        await self.textChannel.send("Majority vote reached. Stopping song and clearing queue.")
-                        voice_client.stop_playing()
-                        return
-                    elif vote_counts["❌"] >= required_votes:
-                        await self.textChannel.send("Majority vote reached. Song will continue playing.")
-                        return
-                    elif len(voters) == len(eligible_users):
-                        await self.textChannel.send("No Majority was found. Song will continue playing.")
-                        return
-            except asyncio.TimeoutError:
-                await self.textChannel.send("Vote timed out. Song will continue playing.")
-    
-    # function to soft disconnect the bot. This is used when a bot is the only one left in a voice channel and should leave, being able to reconnect later
-    async def softDisconnect(self):
-        if self.isConnectedToVC() is True:
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self.songQueue = []
+            self.songQueue.clear()
             self.isLooping = False
+            self.current_audio_source = None
             await voice_client.disconnect(force=False)
-            logging.debug(f"{self.guild.name} Music Controller has been soft disconnected.")
+            logging.debug(f"{self.guild.name} MusicController disconnesso (soft).")
 
-    # function to hard disconnect the bot.
     async def hardDisconnect(self):
-        if self.isConnectedToVC() is True:
+        if self.isConnectedToVC():
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self.songQueue = []
+            self.songQueue.clear()
             self.isLooping = False
+            self.current_audio_source = None
             await voice_client.disconnect(force=True)
-            logging.debug(f"{self.guild.name} Music Controller has been hard disconnected.")
+            logging.debug(f"{self.guild.name} MusicController disconnesso (hard).")
 
-    # function to join the channel and start listening
-    async def two_four_seven(self, voiceChannel: discord.VoiceChannel, textChannel: discord.TextChannel) -> discord.VoiceClient:
-        logging.debug("Starting /247 function")
-        if self.isConnectedToVC() is not True:
-            logging.debug("Bot is not in channel, connecting...")
+    async def two_four_seven(
+        self, voiceChannel: discord.VoiceChannel, textChannel: discord.TextChannel
+    ) -> Optional[discord.VoiceClient]:
+        if not self.isConnectedToVC():
             await voiceChannel.connect(cls=voice_recv.VoiceRecvClient)
-            logging.info(f"Bot succesfully connected to {voiceChannel.name}")
+            logging.info(f"Bot connesso al canale vocale: {voiceChannel.name}")
             self.voiceChannel = voiceChannel
             self.textChannel = textChannel
             await self.startVoiceRecording()
             return None
         else:
             voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            logging.debug(f"Bot is already in channel: {voice_client.channel.name}")
+            self.voiceChannel = voiceChannel
+            self.textChannel = textChannel
             await self.startVoiceRecording()
-            return voice_client    
-        
-    # function to start the voice listening
+            return voice_client
+
     async def startVoiceRecording(self):
-        logging.debug("in voice recording")
+        """Avvia l'ascolto continuo in italiano nel canale vocale."""
+        def on_transcription(user: discord.Member, text: str):
+            asyncio.run_coroutine_threadsafe(
+                self.handleTranscribedAudio(user, text), self.client.loop
+            )
 
-        # override the speech recognition to use google
-        def process_wit(recognizer: sr.Recognizer, audio: sr.AudioData, user: Optional[str]) -> Optional[str]:
-            text: Optional[str] = None
-            try:
-                func = getattr(recognizer, 'recognize_google', recognizer.recognize_google)
-                text = func(audio)
-                # send the transcribed audio to an async event
-                asyncio.run_coroutine_threadsafe(self.handleTranscribedAudio(user, text), self.client.loop)
-            except sr.UnknownValueError:
-                pass
-            return text
-        
         voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+        if not voice_client:
+            return
         try:
-            voice_client.listen(voice_recv.extras.speechrecognition.SpeechRecognitionSink(process_cb=process_wit, default_recognizer="google"))
+            if hasattr(voice_client, "is_listening") and voice_client.is_listening():
+                voice_client.stop_listening()
+            sink = ItalianSpeechSink(on_transcription=on_transcription, language="it-IT")
+            voice_client.listen(sink)
+            logging.info(f"Ascolto vocale in italiano attivo su: {self.guild.name}")
         except Exception as e:
-            logging.exception(e)
+            logging.exception(f"Errore avvio ascolto vocale: {e}")
 
-    # function to handle the transcribed audio for actual commands
-    async def handleTranscribedAudio(self, user, text):
-        logging.info(f"{user.display_name}: {text}")
+    async def handleTranscribedAudio(self, user: discord.Member, text: str):
+        """
+        Gestisce l'audio trascritto in italiano:
+        1. Invia al canale di trascrizione (se attivo)
+        2. Aggiorna eventuali contatori di parole (/counters)
+        3. Verifica se è stata pronunciata la parola di attivazione (wake word)
+        4. Elabora la richiesta (musica o domanda stile Google Assistant) e risponde a voce!
+        """
+        if not text or not text.strip():
+            return
+
+        logging.info(f"[Voce] {user.display_name}: {text}")
+
         if self.transcriptionChannel:
-            await self.transcriptionChannel.send(f"**{user.display_name}**: {text}")
+            try:
+                await self.transcriptionChannel.send(f"🗣️ **{user.display_name}**: {text}")
+            except Exception as e:
+                logging.debug(f"Errore invio trascrizione: {e}")
 
-        if not text.strip():
-            logging.debug(f"text is empty. Doing nothing")
-            return
-        
-        commands = {
-            "play": "handle_play_keyword",
-            "pause": "handle_pause_keyword",
-            "skip": "handle_skip_keyword",
-            "next": "handle_skip_keyword",
-            "loop": "handle_loop_keyword",
-            "stop": "handle_stop_keyword"
-        }
+        # Controlla contatori parole (/counters)
+        word_counters_data = await WordCounter().loadWordCounters()
+        keywords_map = word_counters_data[0] if word_counters_data else {}
+        text_lower = text.lower()
+        if any(
+            re.search(rf"\b{re.escape(kw)}\b", text_lower)
+            for kw in keywords_map.keys()
+        ):
+            await self.handle_word_counter_keyword(user, text_lower)
 
-        keywords = (await WordCounter().loadWordCounters())[0]
-        if any(word in text.lower() for word in keywords):
-            await self.handle_word_counter_keyword(user, text.lower())
-
-        botKeywordsClass = BotKeywords()
-        botKeywords = await botKeywordsClass.loadBotKeywords()
-
-        if not any(word in text.lower() for word in botKeywords):
+        # Verifica la parola di attivazione (wake word) con tolleranza fonetica italiana
+        kw_manager = BotKeywords()
+        activated, matched_wake, remainder = await kw_manager.extractCommandAfterWakeWord(text)
+        if not activated:
             return
 
-        match = re.search(r"(?:{})\s+(\w+)".format("|".join(re.escape(k) for k in botKeywords)), text, re.IGNORECASE)
-        if not match:
-            logging.debug("No command keyword found after bot name")
+        # Controlla se l'utente è bannato
+        banned_ids = await BannedUsers().loadBannedUserIDs()
+        if user.id in banned_ids:
+            await self.speakInVC(f"Mi dispiace {user.display_name}, non sei autorizzato a usare i comandi.")
             return
 
-        keyword = match.group(1).lower()
-        if keyword not in commands:
-            logging.debug(f"'{keyword}' is not a valid command keyword")
+        logging.info(
+            f"[Assistente Attivato da '{matched_wake}'] {user.display_name} -> '{remainder}'"
+        )
+
+        current_song_title = self.songQueue[0].title if self.songQueue else None
+        queue_count = max(0, len(self.songQueue) - 1)
+
+        assistant_resp = await self.ai_assistant.process_request(
+            guild_id=self.guild.id,
+            user_name=user.display_name,
+            user_text=remainder,
+            current_song=current_song_title,
+            queue_count=queue_count,
+        )
+
+        await self.executeAssistantResponse(user, assistant_resp)
+
+    async def executeAssistantResponse(self, user: discord.Member, resp):
+        """Esegue l'azione decisa dall'assistente e parla nel canale vocale (Solo Voce)."""
+        action = resp.action
+        query = resp.query
+        voice_reply = resp.voice_reply
+
+        if action == "none":
+            await self.speakInVC(voice_reply)
             return
 
-        bannedUsersClass = BannedUsers()
-        bannedUsers = await bannedUsersClass.loadBannedUserIDs()
-        if user.id in bannedUsers:
-            await self.textChannel.send(f"User **{user.display_name}** is banned from the bot.")
+        if action == "now_playing":
+            if self.songQueue:
+                dur = await self.getCurrentDuration()
+                clean_dur = dur.replace("*", "")
+                spoken = f"In questo momento sta suonando {self.songQueue[0].title}. Durata: {clean_dur}."
+            else:
+                spoken = "Al momento non c'è nessuna canzone in riproduzione."
+            await self.speakInVC(spoken)
             return
 
-        method_name = commands[keyword]
-        handler = getattr(self, method_name, None)
-        if handler:
-            await handler(user, text)
-        return
+        if action == "play":
+            if not query:
+                await self.speakInVC("Riprendo la riproduzione.")
+                await self.resumeSong()
+                return
 
-    async def handle_word_counter_keyword(self, user, text):
-        logging.debug(f"in handle_word_counter_keyword")
+            # Pronuncia la risposta vocale mentre cerca e accoda il brano
+            speak_task = asyncio.create_task(
+                self.speakInVC(voice_reply or f"Riproduco {query}.")
+            )
+            await self.determineSongSource(user, query)
+            await speak_task
+            return
+
+        if action == "pause":
+            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+            if voice_client and not voice_client.is_paused():
+                await self.pauseSong()
+                await self.speakInVC("Musica in pausa.")
+            else:
+                await self.resumeSong()
+                await self.speakInVC("Riprendo la musica.")
+            return
+
+        if action == "resume":
+            await self.resumeSong()
+            await self.speakInVC(voice_reply or "Riprendo la riproduzione.")
+            return
+
+        if action == "skip":
+            await self.speakInVC(voice_reply or "Salto il brano.")
+            await self.skipSong()
+            return
+
+        if action == "stop":
+            await self.stopAllSongs()
+            await self.speakInVC(voice_reply or "Fermo la musica e svuoto la coda.")
+            return
+
+        if action == "loop":
+            enabled = await self.setLooping()
+            msg = "Ripetizione del brano attivata." if enabled else "Ripetizione disattivata."
+            await self.speakInVC(msg)
+            return
+
+        if action == "shuffle":
+            await self.shuffleQueue()
+            await self.speakInVC(voice_reply or "Ho mescolato la coda di riproduzione.")
+            return
+
+        if action == "volume_up":
+            new_vol = self.setVolume(int(self.volume * 100) + 20)
+            await self.speakInVC(f"Volume alzato al {new_vol} percento.")
+            return
+
+        if action == "volume_down":
+            new_vol = self.setVolume(int(self.volume * 100) - 20)
+            await self.speakInVC(f"Volume abbassato al {new_vol} percento.")
+            return
+
+        if action == "volume_set":
+            try:
+                target = int(re.sub(r"\D", "", query) or "70")
+            except ValueError:
+                target = 70
+            new_vol = self.setVolume(target)
+            await self.speakInVC(f"Volume impostato al {new_vol} percento.")
+            return
+
+        if action == "disconnect":
+            await self.speakInVC(voice_reply or "A presto!")
+            await self.hardDisconnect()
+            return
+
+        # Qualsiasi altra risposta
+        if voice_reply:
+            await self.speakInVC(voice_reply)
+
+    async def handle_word_counter_keyword(self, user: discord.Member, text_lower: str):
         wordCounterClass = WordCounter()
         mapping = (await wordCounterClass.loadWordCounters())[0]
 
-        counter_hits = {}
-
         for keyword, counter_name in mapping.items():
-            count = text.count(keyword)
+            matches = re.findall(rf"\b{re.escape(keyword)}\b", text_lower)
+            count = len(matches)
             if count > 0:
-                counter_hits[counter_name] = counter_hits.get(counter_name, 0) + count
                 for _ in range(count):
                     await wordCounterClass.incrementCounterForKeyword(keyword)
                     new_count = await wordCounterClass.getCount(counter_name)
-                    embed = discord.Embed(
-                        title=f"{counter_name.capitalize()} Counter:",
-                        description=f"{new_count} - {user.display_name}",
-                        color=0xa600ff,
-                    )
-                    embed.set_thumbnail(url=self.client.user.avatar.url)
-                    await self.textChannel.send(embed=embed)
+                    if self.textChannel:
+                        embed = discord.Embed(
+                            title=f"🔢 Contatore {counter_name.capitalize()}:",
+                            description=f"**{new_count}** — pronunciato da {user.display_name}",
+                            color=0xA600FF,
+                        )
+                        if self._bot_avatar_url():
+                            embed.set_thumbnail(url=self._bot_avatar_url())
+                        await self.textChannel.send(embed=embed)
 
-        logging.info(f"{user.display_name} triggered updates for: {counter_hits}")
-        return
-
-
-    async def handle_play_keyword(self, user, text):
-        logging.debug(f"In handle_play_keyword")
-        botKeywordsClass = BotKeywords()
-        botKeywords = await botKeywordsClass.loadBotKeywords()
-        match = re.search(r"(?:{})\s+play\s+(.*)".format("|".join(re.escape(k) for k in botKeywords)), text, re.IGNORECASE)
-        if not match:
-            logging.debug("No query found after 'keyword play', assume user wants to resume")
-            await self.textChannel.send(f"Voice Activated - Resuming Song")
-            await self.resumeSong()
-            return
-        query = match.group(1).strip()
-        await self.textChannel.send(f"Voice Activated - Searching for song: {query}")
-        await self.handleYoutubeSearch(user, query)
-        return
-    
-    async def handle_pause_keyword(self, user, text):
-        logging.debug(f"In handle_pause_keyword")
-        if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            if not voice_client.is_paused():
-                await self.textChannel.send(f"Voice Activated - Pausing Song")
-            else:
-                await self.textChannel.send(f"Voice Activated - Resuming Song")
-            await self.pauseSong()
-            return
-    
-    async def handle_skip_keyword(self, user, text):
-        logging.debug(f"In handle_skip_keyword")
-        if self.isConnectedToVC():
-            if not self.isMajorityVote:
-                await self.textChannel.send(f"Voice Activated - Skipping Song")
-            await self.skipSong()
-            return
-        
-    async def handle_stop_keyword(self, user, text):
-        logging.debug(f"In handle_stop_keyword")
-        if self.isConnectedToVC():
-            if not self.isMajorityVote:
-                await self.textChannel.send(f"Voice Activated - Stopping Song and clearing queue")
-            await self.stopAllSongs()
-            return
-        
-    async def handle_loop_keyword(self, user, text):
-        logging.debug(f"In handle_loop_keyword")
-        if self.isConnectedToVC():
-            if await self.setLooping():
-                await self.textChannel.send(f"Voice Activated - Looping Enabled")
-            else:
-                await self.textChannel.send(f"Voice Activated - Looping Disabled")
-            return
-    
     async def handleFile(self, user: discord.User, file: discord.Attachment):
-        logging.debug(f"In handleFile")
-        # create a song object
-        fileSong = Song(file.filename, file.url, file.url, self.client.user.avatar.url, 0, user, isFile=True)
-        # queue the song
+        fileSong = Song(
+            file.filename,
+            file.url,
+            file.url,
+            self._bot_avatar_url(),
+            0,
+            user,
+            isFile=True,
+        )
         await self.queueSong(fileSong)
-        return
-    
+
     async def determineSongSource(self, user: discord.User, query: str):
-        logging.debug(f"In Determine Song Source")
-        query_lower = query.lower()
+        query_lower = query.lower().strip()
 
-        # Regex patterns
-        youtube_pattern = re.compile(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/')
-        youtube_playlist_pattern = re.compile(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/playlist\?list=[\w-]+')
-        spotify_pattern = re.compile(r'(https?://)?(open\.)?spotify\.com/')
-        spotify_playlist_pattern = re.compile(r'(https?://)?(open\.)?spotify\.com/(playlist|album)/[a-zA-Z0-9]+')
-        soundcloud_pattern = re.compile(r'(https?://)?(www\.)?soundcloud\.com/')
-        soundcloud_playlist_pattern = re.compile(r'^(https?://)?(www\.)?soundcloud\.com/[^/]+/sets/[^/]+/?')
+        youtube_pattern = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/")
+        youtube_playlist_pattern = re.compile(
+            r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/playlist\?list=[\w-]+"
+        )
+        spotify_pattern = re.compile(r"(https?://)?(open\.)?spotify\.com/")
+        spotify_playlist_pattern = re.compile(
+            r"(https?://)?(open\.)?spotify\.com/(?:intl-[a-z]+/)?(playlist|album)/[a-zA-Z0-9]+"
+        )
+        soundcloud_pattern = re.compile(r"(https?://)?(www\.)?soundcloud\.com/")
+        soundcloud_playlist_pattern = re.compile(
+            r"^(https?://)?(www\.)?soundcloud\.com/[^/]+/sets/[^/]+/?"
+        )
 
-        # Determine source
         if youtube_pattern.search(query_lower):
-            logging.debug("Detected YouTube link")
             if youtube_playlist_pattern.search(query_lower):
-                logging.debug("Detected YouTube playlist")
                 return await self.handleYoutubePlaylist(user, query)
             return await self.handleYoutubeLink(user, query)
         elif spotify_pattern.search(query_lower):
-            logging.debug("Detected Spotify link")
             if spotify_playlist_pattern.search(query_lower):
-                logging.debug("Detected spotify playlist/album")
                 return await self.handleSpotifyPlaylist(user, query)
             return await self.handleSpotifyLink(user, query)
         elif soundcloud_pattern.search(query_lower):
-            logging.debug("Detected SoundCloud link")
             if soundcloud_playlist_pattern.search(query_lower):
-                logging.debug("Detected SoundCloud playlist")
                 return await self.handleSoundCloudPlaylist(user, query)
             return await self.handleSoundCloudLink(user, query)
         else:
-            logging.debug("Detected search query - assuming YouTube search")
             return await self.handleYoutubeSearch(user, query)
-        
+
     async def handleYoutubeLink(self, user, url):
-        logging.debug("In handleYoutubeLink")
-        # get the song info from the youtube link
         searcher = VideoSearcher()
         try:
             result = await searcher.getVideoInfoFromURL(url)
         except Exception as e:
             logging.error(e)
-            await self.textChannel.send(f"Unable to add song: {e}")
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile aggiungere il brano: {e}")
             return
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find song.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Brano non trovato.")
             return
-        # create a song object
-        youtubeSong = Song(result['title'], url, result['link'], result['thumbnail'], result['duration'], user, isFile=False)
-        # queue the song
+        youtubeSong = Song(
+            result["title"],
+            url,
+            result["link"],
+            result["thumbnail"] or self._bot_avatar_url(),
+            result["duration"],
+            user,
+            isFile=False,
+        )
         await self.queueSong(youtubeSong)
-        return
-    
+
     async def handleYoutubePlaylist(self, user, url):
-        logging.debug("In handleYoutubePlaylist")
-        # get the playlist info from the youtube link
         searcher = VideoSearcher()
         result = await searcher.getPlaylistInfo(url)
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find playlist.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Impossibile trovare la playlist.")
             return
-        # get the playlist name and the number of songs
         metadata = result.pop(0)
-        thumbnail = metadata.get('thumbnail') or self.client.user.avatar.url
-        # send the "Adding Playlist" discord embed
-        embed = discord.Embed(
-            title="Adding Playlist:",
-            color=0xa600ff,
-            )
-        embed.set_thumbnail(url=thumbnail)
-        embed.add_field(name="Playlist Name", value=metadata['playlist_name'], inline=False)
-        embed.add_field(name="# of Songs", value=metadata['song_count'], inline=False)
-        await self.textChannel.send(embed=embed)
+        thumbnail = metadata.get("thumbnail") or self._bot_avatar_url()
+        if self.textChannel:
+            embed = discord.Embed(title="📂 Aggiunta Playlist:", color=0xA600FF)
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
+            embed.add_field(name="Nome Playlist", value=metadata["playlist_name"], inline=False)
+            embed.add_field(name="Numero di Brani", value=str(metadata["song_count"]), inline=False)
+            await self.textChannel.send(embed=embed)
+
         for song in result:
-            logging.debug(f"Searching for {song['url']}")
             try:
-                # grab the video info for each song in the playlist
-                songInfo = await searcher.getVideoInfoFromURL(song['url'])
+                songInfo = await searcher.getVideoInfoFromURL(song["url"])
+                if not songInfo:
+                    continue
+                youtubeSong = Song(
+                    songInfo["title"],
+                    song["url"],
+                    songInfo["link"],
+                    songInfo["thumbnail"] or self._bot_avatar_url(),
+                    songInfo["duration"],
+                    user,
+                    isFile=False,
+                )
+                await self.queueSong(youtubeSong)
             except Exception as e:
                 logging.error(e)
-                await self.textChannel.send(f"Unable to add song: {e}")
                 continue
-            # create a song object and append it to the playlist
-            youtubeSong = Song(songInfo['title'], song['url'], songInfo['link'], songInfo['thumbnail'], songInfo['duration'], user, isFile=False)
-            # queue the song
-            await self.queueSong(youtubeSong)
-        return
 
     async def handleSpotifyLink(self, user, url):
-        logging.debug("In handleSpotifyLink")
-        # get the name and artist of song from spotify API
-        spotifySongInfo = await self.spotify.getSpotifySongInfo(url)
-        query = f"{spotifySongInfo['title']} by {spotifySongInfo['artist']}"
-        logging.debug(f"searching for spotify song: {query}")
-        # get the song info from the youtube search query
+        try:
+            spotifySongInfo = await self.spotify.getSpotifySongInfo(url)
+        except Exception as e:
+            logging.error(e)
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Errore lettura link Spotify: {e}")
+            return
+
+        artist = spotifySongInfo.get("artist", "")
+        query = f"{spotifySongInfo['title']} {artist}".strip()
         searcher = VideoSearcher()
         try:
             result = await searcher.getVideoInfoFromQuery(query)
         except Exception as e:
             logging.error(e)
-            await self.textChannel.send(f"Unable to add song: {e}")
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile aggiungere il brano: {e}")
             return
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find song.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Brano non trovato.")
             return
-        # create a song object
-        youtubeSong = Song(result['title'], result['url'], result['link'], result['thumbnail'], result['duration'], user, isFile=False)
-        # queue the song
+        youtubeSong = Song(
+            result["title"],
+            result["url"],
+            result["link"],
+            result["thumbnail"] or self._bot_avatar_url(),
+            result["duration"],
+            user,
+            isFile=False,
+        )
         await self.queueSong(youtubeSong)
-        return
-    
+
     async def handleSpotifyPlaylist(self, user, playlist):
-        logging.debug("In handleSpotifyPlaylist")
-        # get the playlist info from spotify API
-        result = await self.spotify.getSpotifyPlaylistInfo(playlist)
-        # check if result came back successfully
-        if not result:
-            await self.textChannel.send(f"Unable to find spotify playlist/album.")
+        try:
+            result = await self.spotify.getSpotifyPlaylistInfo(playlist)
+        except Exception as e:
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile caricare la playlist Spotify: {e}")
             return
-        # get the playlist name, number of songs, and thumbnail
+        if not result:
+            if self.textChannel:
+                await self.textChannel.send("❌ Playlist o album Spotify non trovato.")
+            return
         playlist_info = result.pop(0)
-        thumbnail = playlist_info.get('thumbnail') or self.client.user.avatar.url
-        # send the "Adding Playlist" discord embed
-        embed = discord.Embed(
-            title="Adding Playlist:",
-            color=0xa600ff,
-            )
-        embed.set_thumbnail(url=thumbnail)
-        embed.add_field(name="Playlist Name", value=playlist_info['title'], inline=False)
-        embed.add_field(name="# of Songs", value=len(result), inline=False)
-        await self.textChannel.send(embed=embed)
+        thumbnail = playlist_info.get("thumbnail") or self._bot_avatar_url()
+        if self.textChannel:
+            embed = discord.Embed(title="📂 Aggiunta Playlist Spotify:", color=0xA600FF)
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
+            embed.add_field(name="Nome Playlist", value=playlist_info["title"], inline=False)
+            embed.add_field(name="Numero di Brani", value=str(len(result)), inline=False)
+            await self.textChannel.send(embed=embed)
+
         searcher = VideoSearcher()
         for song in result:
-            query = f"{song['title']} by {song['artist']}"
-            logging.debug(f"Searching for {query}")
+            query = f"{song['title']} {song['artist']}".strip()
             try:
-                # grab the video info for each song in the playlist
                 songInfo = await searcher.getVideoInfoFromQuery(query)
+                if not songInfo:
+                    continue
+                youtubeSong = Song(
+                    songInfo["title"],
+                    songInfo["url"],
+                    songInfo["link"],
+                    songInfo["thumbnail"] or self._bot_avatar_url(),
+                    songInfo["duration"],
+                    user,
+                    isFile=False,
+                )
+                await self.queueSong(youtubeSong)
             except Exception as e:
                 logging.error(e)
-                await self.textChannel.send(f"Unable to add song: {e}")
                 continue
-            # create a song object
-            youtubeSong = Song(songInfo['title'], songInfo['url'], songInfo['link'], songInfo['thumbnail'], songInfo['duration'], user, isFile=False)
-            # queue the song
-            await self.queueSong(youtubeSong)
-        return
 
     async def handleSoundCloudLink(self, user, url):
-        logging.debug("In handleSoundCloudLink")
-        # get the song info from the soundcloud link
         searcher = VideoSearcher()
         try:
             result = await searcher.getVideoInfoFromURL(url)
         except Exception as e:
             logging.error(e)
-            await self.textChannel.send(f"Unable to add song: {e}")
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile aggiungere il brano: {e}")
             return
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find song.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Brano SoundCloud non trovato.")
             return
-        # create a song object
-        soundcloudSong = Song(result['title'], url, result['link'], result['thumbnail'], result['duration'], user, isFile=False)
-        # queue the song
+        soundcloudSong = Song(
+            result["title"],
+            url,
+            result["link"],
+            result["thumbnail"] or self._bot_avatar_url(),
+            result["duration"],
+            user,
+            isFile=False,
+        )
         await self.queueSong(soundcloudSong)
-        return
-    
+
     async def handleSoundCloudPlaylist(self, user, url):
-        logging.debug("In handleSoundCloudPlaylist")
-        # get the playlist info from the soundcloud link
         searcher = VideoSearcher()
         result = await searcher.getPlaylistInfo(url)
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find playlist.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Impossibile trovare la playlist SoundCloud.")
             return
-        # get the playlist name and the number of songs
         metadata = result.pop(0)
-        thumbnail = metadata.get('thumbnail') or self.client.user.avatar.url
-        # send the "Adding Playlist" discord embed
-        embed = discord.Embed(
-            title="Adding Playlist:",
-            color=0xa600ff,
-            )
-        embed.set_thumbnail(url=thumbnail)
-        embed.add_field(name="Playlist Name", value=metadata['playlist_name'], inline=False)
-        embed.add_field(name="# of Songs", value=metadata['song_count'], inline=False)
-        await self.textChannel.send(embed=embed)
+        thumbnail = metadata.get("thumbnail") or self._bot_avatar_url()
+        if self.textChannel:
+            embed = discord.Embed(title="📂 Aggiunta Playlist SoundCloud:", color=0xA600FF)
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
+            embed.add_field(name="Nome Playlist", value=metadata["playlist_name"], inline=False)
+            embed.add_field(name="Numero di Brani", value=str(metadata["song_count"]), inline=False)
+            await self.textChannel.send(embed=embed)
+
         for song in result:
-            logging.debug(f"Searching for {song['url']}")
             try:
-                # grab the video info for each song in the playlist
-                songInfo = await searcher.getVideoInfoFromURL(song['url'])
+                songInfo = await searcher.getVideoInfoFromURL(song["url"])
+                if not songInfo:
+                    continue
+                soundcloudSong = Song(
+                    songInfo["title"],
+                    song["url"],
+                    songInfo["link"],
+                    songInfo["thumbnail"] or self._bot_avatar_url(),
+                    songInfo["duration"],
+                    user,
+                    isFile=False,
+                )
+                await self.queueSong(soundcloudSong)
             except Exception as e:
                 logging.error(e)
-                await self.textChannel.send(f"Unable to add song: {e}")
                 continue
-            # create a song object and append it to the playlist
-            soundcloudSong = Song(songInfo['title'], song['url'], songInfo['link'], songInfo['thumbnail'], songInfo['duration'], user, isFile=False)
-            # queue the song
-            await self.queueSong(soundcloudSong)
-        return
 
     async def handleYoutubeSearch(self, user, query):
-        logging.debug("In handleYoutubeSearch")
-        # get the song info from the youtube search query
         searcher = VideoSearcher()
         try:
             result = await searcher.getVideoInfoFromQuery(query)
         except Exception as e:
             logging.error(e)
-            await self.textChannel.send(f"Unable to add song: {e}")
+            if self.textChannel:
+                await self.textChannel.send(f"❌ Impossibile cercare il brano: {e}")
             return
-        # check if result came back successfully
         if not result:
-            await self.textChannel.send(f"Unable to find song.")
+            if self.textChannel:
+                await self.textChannel.send("❌ Nessun brano trovato.")
             return
-        # create a song object
-        youtubeSong = Song(result['title'], result['url'], result['link'], result['thumbnail'], result['duration'], user, isFile=False)
-        # queue the song
+        youtubeSong = Song(
+            result["title"],
+            result["url"],
+            result["link"],
+            result["thumbnail"] or self._bot_avatar_url(),
+            result["duration"],
+            user,
+            isFile=False,
+        )
         await self.queueSong(youtubeSong)
-        return
 
     async def queueSong(self, song: Song):
-        logging.debug("In queueSong")
-        # check if song should play right away or go into the queue
         if not self.songQueue:
-            logging.debug("Queue is empty, playing song right away.")
             self.songQueue.append(song)
-            print("songQueue: ", self.songQueue)
             await self.playSong()
-            return
         else:
-            logging.debug("Adding song to queue.")
             self.songQueue.append(song)
-            print("songQueue: ", self.songQueue)
-            # send the "Added to Queue" discord embed
-            embed = discord.Embed(
-                title="Added to Queue:",
-                description=song.title,
-                color=0xa600ff,
+            if self.textChannel:
+                embed = discord.Embed(
+                    title="➕ Aggiunto alla Coda:",
+                    description=song.title,
+                    color=0xA600FF,
                 )
-            embed.set_thumbnail(url=song.thumbnail)
-            await self.textChannel.send(embed=embed)
-            return
-        
-    async def queuePlaylist(self, playlist: list):
-        logging.debug("In queuePlaylist")
-        # pop the thumbnail from the playlist
-        thumbnail = playlist.pop(0)
-        # check if playlist should play right away or go into the queue
-        if not self.songQueue:
-            logging.debug("Queue is empty, playing playlist right away.")
-            for song in playlist:
-                self.songQueue.append(song)
-            print("songQueue: ", self.songQueue)
-            await self.playSong()
-        else:
-            logging.debug("Adding playlist to queue.")
-            for song in playlist:
-                self.songQueue.append(song)
-            print("songQueue: ", self.songQueue)
+                if song.thumbnail:
+                    embed.set_thumbnail(url=song.thumbnail)
+                await self.textChannel.send(embed=embed)
 
-        # send the "Added to Queue" discord embed
-        embed = discord.Embed(
-            title="Playlist Added to Queue:",
-            color=0xa600ff,
-            )
-        embed.set_thumbnail(url=thumbnail)
-        for i, song in enumerate(playlist, start=1):
-            embed.add_field(name=f"{i}", value=song.title, inline=False)
-        await self.textChannel.send(embed=embed)
-        return
-        
     async def playSong(self):
-        logging.debug("In playSong.")
-
-        # check to make sure there is a song in queue
         if not self.songQueue:
-            await self.textChannel.send("No more songs to play.")
+            self.current_audio_source = None
             self.start_time = None
             self.pause_duration = 0
             self.pause_start = None
             return
 
+        # Attendi eventuale TTS standalone in corso prima di avviare il player musicale
+        if self._tts_lock.locked():
+            async with self._tts_lock:
+                pass
+
+        if not self.songQueue:
+            return
+
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            'options': '-vn -filter:a "volume=0.7"'
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            "options": f'-vn -filter:a "volume={self.volume:.2f}"',
         }
 
-        # get the next song to play
         song = self.songQueue[0]
 
         if not song.isFile:
-            if getSongExpiration(song.link) <= int(time.time()):
-                logging.debug(f"Stream URL is expired. Fetching new one")
-                # get the song info from the link
+            exp = getSongExpiration(song.link)
+            if exp is not None and exp <= int(time.time()):
+                logging.debug("Stream URL scaduto, rigenero il link...")
                 searcher = VideoSearcher()
                 try:
                     result = await searcher.getVideoInfoFromURL(song.url)
+                    if result and result.get("link"):
+                        song.link = result["link"]
                 except Exception as e:
-                    logging.error(e)
-                    await self.textChannel.send(f"Unable to add song: {e}")
-                    return
-                # update the current songs stream link
-                song.link = result['link']
+                    logging.error(f"Errore aggiornamento URL scaduto: {e}")
+                    if self.textChannel:
+                        await self.textChannel.send(f"❌ Impossibile riprodurre il brano: {e}")
+                    self.songQueue.pop(0)
+                    return await self.playSong()
 
-        # create the discord player for current song
-        player = discord.FFmpegOpusAudio(song.link, **ffmpeg_options)
+        raw_player = discord.FFmpegOpusAudio(song.link, **ffmpeg_options)
+        interruptible_player = InterruptibleOpusSource(raw_player)
+        self.current_audio_source = interruptible_player
 
-        # function to call after a song is done playing
         def after_playing(error):
             if error:
-                logging.error(f"Error during playback: {error}")
-            else:
-                if self.isLooping:
-                    logging.debug("Song finished, replaying previous song.")
-                else:
-                    logging.debug("Song finished, popping from queue and checking next")
-                    if self.songQueue:
-                        self.songQueue.pop(0)
-                fut = asyncio.run_coroutine_threadsafe(self.playSong(), self.client.loop)
-                fut.add_done_callback(lambda f: f.exception())
+                logging.error(f"Errore durante la riproduzione: {error}")
+            if not self.isLooping and self.songQueue:
+                self.songQueue.pop(0)
+            fut = asyncio.run_coroutine_threadsafe(self.playSong(), self.client.loop)
+            fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
 
-        # get the voice client and play the song
         voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-        voice_client.play(player, after=after_playing)
+        if not voice_client or not voice_client.is_connected():
+            return
 
-        # start the duration timer
+        voice_client.play(interruptible_player, after=after_playing)
+
         self.start_time = int(time.time())
         self.pause_duration = 0
         self.pause_start = None
 
-        # send the "Now Playing" discord embed
-        embed = discord.Embed(
-            title="Now Playing:",
-            description=song.title,
-            color=0xa600ff,
+        if self.textChannel:
+            embed = discord.Embed(
+                title="🎶 In Riproduzione:",
+                description=song.title,
+                color=0xA600FF,
             )
-        embed.set_thumbnail(url=song.thumbnail)
-        await self.textChannel.send(embed=embed, view=MusicButtons(client= self.client))
+            if song.thumbnail:
+                embed.set_thumbnail(url=song.thumbnail)
+            await self.textChannel.send(embed=embed, view=MusicButtons(client=self.client))

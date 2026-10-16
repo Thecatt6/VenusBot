@@ -7,10 +7,13 @@ brotli==1.2.0
 certifi==2025.4.26
 cffi==1.17.1
 charset-normalizer==3.4.2
+click==8.1.8
 discord-ext-voice_recv @ git+https://github.com/VenusMods/discord-ext-voice-recv.git@5d15c470073d28e2fa8dc155e65c54768f251b69
 discord.py==2.6.4
 dotenv==0.9.9
+edge-tts==7.3.1
 frozenlist==1.7.0
+gTTS==2.5.4
 idna==3.10
 multidict==6.4.4
 mutagen==1.47.0
@@ -21,6 +24,7 @@ PyNaCl==1.5.0
 python-dotenv==1.1.0
 requests==2.32.4
 SpeechRecognition==3.10.4
+tabulate==0.10.0
 typing_extensions==4.14.0
 urllib3==2.4.0
 websockets==15.0.1
