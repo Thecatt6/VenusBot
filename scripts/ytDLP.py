@@ -1,6 +1,8 @@
 import asyncio
 import re
 import os
+import logging
+from shutil import which
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from pathlib import Path
@@ -27,18 +29,31 @@ class VideoSearcher():
     def __init__(self):
         root_dir = Path(__file__).resolve().parent.parent
         self.cookies_path = root_dir / "cookies.txt"
+        self.deno_path = which("deno")
+        if not self.deno_path:
+            logging.warning(
+                "Deno was not found. YouTube playback needs Deno to solve yt-dlp EJS challenges."
+            )
+
+    def _yt_dlp_options(self, **overrides):
+        """Return the common yt-dlp configuration used for YouTube extraction."""
+        options = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'noplaylist': True,
+            'cookiefile': str(self.cookies_path),
+            'cachedir': False,
+            # Deno is the recommended EJS runtime for current YouTube challenges.
+            'js_runtimes': {'deno': {'path': self.deno_path}} if self.deno_path else {'deno': {}},
+        }
+        options.update(overrides)
+        return options
 
     async def getVideoInfoFromURL(self, video_url):
         loop = asyncio.get_running_loop()
 
         def extract_info():
-            yt_dlp_options = {
-                'format': 'bestaudio/best',
-                'quiet': True,
-                'noplaylist': True,
-                'cookiefile': str(self.cookies_path),
-                'cachedir': False,
-            }
+            yt_dlp_options = self._yt_dlp_options()
             with YoutubeDL(yt_dlp_options) as ytdlp:
                 info = ytdlp.extract_info(video_url, download=False)
                 return {
@@ -54,15 +69,10 @@ class VideoSearcher():
         loop = asyncio.get_running_loop()
 
         def extract_info():
-            yt_dlp_options = {
-                'format': 'bestaudio/best',
-                'quiet': True,
-                'noplaylist': True,
-                'cookiefile': str(self.cookies_path),
-                'cachedir': False,
-                'default_search': 'ytsearch',
-                'max_downloads': 1
-            }
+            yt_dlp_options = self._yt_dlp_options(
+                default_search='ytsearch',
+                max_downloads=1,
+            )
             with YoutubeDL(yt_dlp_options) as ytdlp:
                 info = ytdlp.extract_info(f"{video_query} lyrics", download=False)
                 video = info['entries'][0] if 'entries' in info else info
@@ -80,16 +90,11 @@ class VideoSearcher():
         loop = asyncio.get_running_loop()
 
         def extract_info():
-            yt_dlp_options = {
-                'format': 'bestaudio/best',
-                'quiet': True,
-                'noplaylist': True,
-                'cookiefile': str(self.cookies_path),
-                'cachedir': False,
-                'default_search': 'ytsearch10',
-                'ignoreerrors': True,
-                'extract_flat': 'in_playlist',
-            }
+            yt_dlp_options = self._yt_dlp_options(
+                default_search='ytsearch10',
+                ignoreerrors=True,
+                extract_flat='in_playlist',
+            )
             with YoutubeDL(yt_dlp_options) as ytdlp:
                 info = ytdlp.extract_info(f"{video_query} lyrics", download=False)
                 entries = info['entries'] if 'entries' in info else [info]
@@ -108,13 +113,10 @@ class VideoSearcher():
         loop = asyncio.get_running_loop()
 
         def extract_info():
-            yt_dlp_options = {
-                'format': 'bestaudio/best',
-                'quiet': False,
-                'extract_flat': 'in_playlist',
-                'cookiefile': str(self.cookies_path),
-                'cachedir': False
-            }
+            yt_dlp_options = self._yt_dlp_options(
+                quiet=False,
+                extract_flat='in_playlist',
+            )
             with YoutubeDL(yt_dlp_options) as ytdlp:
                 playlist = ytdlp.extract_info(playlist_url, download=False)
                 metadata = {
@@ -131,14 +133,10 @@ class VideoSearcher():
         loop = asyncio.get_running_loop()
 
         def extract_info():
-            yt_dlp_options = {
-                'format': 'bestaudio/best',
-                'quiet': False,
-                # 'extract_flat': 'in_playlist',
-                'cookiefile': str(self.cookies_path),
-                'cachedir': False,
-                'ignoreerrors': True
-            }
+            yt_dlp_options = self._yt_dlp_options(
+                quiet=False,
+                ignoreerrors=True,
+            )
             with YoutubeDL(yt_dlp_options) as ytdlp:
                 playlist = ytdlp.extract_info(playlist_url, download=False)
                 return [{
@@ -153,3 +151,4 @@ class VideoSearcher():
                 
 
         return await loop.run_in_executor(None, extract_info)
+
