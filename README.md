@@ -194,4 +194,3 @@ Makes the specified user an admin.
 
 ### /removeadmin
 Removes admin from the specified user.
-
