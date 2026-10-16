@@ -159,6 +159,69 @@ class SpotifyController:
 
         return None
 
+    async def getRelatedTrack(
+        self, seed_title: str, exclude_titles: Optional[list[str]] = None
+    ) -> Optional[dict]:
+        """
+        Trova un brano correlato/dello stesso artista su Spotify per la modalità Autoplay.
+        """
+        if not self.is_configured() or not seed_title:
+            return None
+
+        exclude_norm = {t.lower().strip() for t in (exclude_titles or []) if t}
+        exclude_norm.add(seed_title.lower().strip())
+
+        # Estrai il nome dell'artista se il titolo è "Artista - Brano"
+        artist_part = seed_title.split("-")[0].strip() if "-" in seed_title else seed_title.strip()
+        access_token = await self.get_access_token()
+        if not access_token:
+            return None
+
+        search_url = "https://api.spotify.com/v1/search"
+        params = {
+            "q": artist_part,
+            "type": "track",
+            "market": "IT",
+            "limit": "10",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            try:
+                async with session.get(
+                    search_url,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=6),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get("tracks", {}).get("items", [])
+                        for track in items:
+                            title = track.get("name", "")
+                            artists = [a["name"] for a in track.get("artists", []) if a.get("name")]
+                            primary_artist = artists[0] if artists else ""
+                            full_display = f"{primary_artist} - {title}" if primary_artist else title
+                            if (
+                                full_display.lower() in exclude_norm
+                                or title.lower() in exclude_norm
+                                or any(title.lower() in ex for ex in exclude_norm)
+                            ):
+                                continue
+                            images = track.get("album", {}).get("images", [])
+                            return {
+                                "title": title,
+                                "artist": primary_artist,
+                                "full_title": full_display,
+                                "search_query": full_display,
+                                "thumbnail": images[0]["url"] if images else None,
+                                "duration": int(round((track.get("duration_ms") or 0) / 1000)),
+                            }
+            except Exception as e:
+                logging.debug(f"Errore Autoplay Spotify: {e}")
+
+        return None
+
     def extract_track_id(self, spotify_url: str) -> str:
         match = re.search(r"spotify\.com/(?:intl-[a-z]+/)?track/([a-zA-Z0-9]+)", spotify_url)
         if match:

@@ -251,6 +251,19 @@ class InterruptibleOpusSource(discord.AudioSource):
             self._override_start_time = time.time()
             self._on_override_end = on_end
 
+    def replace_main_source(self, new_main_source: discord.AudioSource) -> None:
+        """
+        Sostituisce a caldo la sorgente musicale principale (es. per cambio volume istantaneo
+        o riavvio del brano da capo) senza interrompere il player di Discord.
+        """
+        with self._lock:
+            old_main = self.main_source
+            self.main_source = new_main_source
+            try:
+                old_main.cleanup()
+            except Exception:
+                pass
+
     def cancel_interrupt(self) -> None:
         with self._lock:
             self._finish_override_locked()

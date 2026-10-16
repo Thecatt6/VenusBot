@@ -73,8 +73,11 @@ class MusicController:
 
         self.songQueue: list[Song] = []
         self.isLooping: bool = False
+        self.isAutoplay: bool = False
         self.isMajorityVote: bool = False
         self.volume: float = 0.70
+        self._played_history: list[str] = []
+        self._last_seed_song: Optional[Tuple[str, discord.User]] = None
 
         self.start_time: Optional[int] = None
         self.pause_start: Optional[int] = None
@@ -202,10 +205,81 @@ class MusicController:
     def getIsMajorityVote(self) -> bool:
         return self.isMajorityVote
 
+    def _get_elapsed_seconds(self) -> int:
+        if not self.songQueue or self.start_time is None:
+            return 0
+        voice_client = self._get_voice_client()
+        if voice_client and voice_client.is_paused() and self.pause_start is not None:
+            elapsed = int(self.pause_start - self.start_time - self.pause_duration)
+        else:
+            elapsed = int(time.time() - self.start_time - self.pause_duration)
+        return max(0, elapsed)
+
     def setVolume(self, volume_percent: int) -> int:
         clamped = max(5, min(150, int(volume_percent)))
         self.volume = clamped / 100.0
+
+        # Aggiorna il volume in tempo reale sul brano attualmente in riproduzione
+        if (
+            self.current_audio_source is not None
+            and self.songQueue
+            and self.isConnectedToVC()
+        ):
+            song = self.songQueue[0]
+            elapsed = self._get_elapsed_seconds()
+            before_opts = self._build_ffmpeg_before_options(song)
+            if song.duration > 0 and elapsed > 0:
+                before_opts = f"{before_opts} -ss {elapsed}"
+            try:
+                new_raw = discord.FFmpegOpusAudio(
+                    song.link,
+                    before_options=before_opts,
+                    options=f'-vn -loglevel error -filter:a "volume={self.volume:.2f}"',
+                )
+                self.current_audio_source.replace_main_source(new_raw)
+            except Exception as e:
+                logging.debug(f"Aggiornamento volume live non applicato: {e}")
+
         return clamped
+
+    async def replaySong(self) -> bool:
+        """Riavvia il brano corrente dall'inizio (0:00) senza interrompere il player."""
+        if (
+            self.current_audio_source is not None
+            and self.songQueue
+            and self.isConnectedToVC()
+        ):
+            song = self.songQueue[0]
+            before_opts = self._build_ffmpeg_before_options(song)
+            try:
+                new_raw = discord.FFmpegOpusAudio(
+                    song.link,
+                    before_options=before_opts,
+                    options=f'-vn -loglevel error -filter:a "volume={self.volume:.2f}"',
+                )
+                self.current_audio_source.replace_main_source(new_raw)
+                self.start_time = int(time.time())
+                self.pause_duration = 0
+                self.pause_start = None
+                return True
+            except Exception as e:
+                logging.debug(f"Errore replay brano: {e}")
+        return False
+
+    def clearUpcomingQueue(self) -> int:
+        """Svuota i brani in coda mantenendo in riproduzione il brano corrente."""
+        if len(self.songQueue) <= 1:
+            return 0
+        upcoming = self.songQueue[1:]
+        count = len(upcoming)
+        for s in upcoming:
+            s.cleanup_cache_file()
+        del self.songQueue[1:]
+        return count
+
+    async def setAutoplay(self) -> bool:
+        self.isAutoplay = not self.isAutoplay
+        return self.isAutoplay
 
     def setTTSVoice(self, voice_name: str) -> str:
         return self.tts_engine.set_voice(voice_name)
@@ -678,10 +752,46 @@ class MusicController:
                 await self.resumeSong()
                 return
 
-            # Pronuncia prima la conferma vocale e poi avvia il caricamento/riproduzione
-            # per evitare qualsiasi conflitto sul player audio di Discord
-            await self.speakInVC(voice_reply or f"Riproduco {query}.")
-            await self.determineSongSource(user, query)
+            # Se è una ricerca di un singolo brano, avvia la ricerca/download in parallelo
+            # mentre il bot pronuncia la conferma vocale, azzerando i tempi di attesa!
+            is_url = bool(re.search(r"https?://", query.lower()))
+            if not is_url:
+                prep_task = asyncio.create_task(self._prepareSearchSong(user, query))
+                await self.speakInVC(voice_reply or f"Riproduco {query}.")
+                song = await prep_task
+                if song:
+                    await self.queueSong(song)
+                else:
+                    await self.speakInVC("Mi dispiace, non sono riuscito a trovare il brano.")
+            else:
+                await self.speakInVC(voice_reply or "Carico il brano richiesto.")
+                await self.determineSongSource(user, query)
+            return
+
+        if action == "replay":
+            replayed = await self.replaySong()
+            if replayed:
+                await self.speakInVC(voice_reply or "Rimetto la canzone dall'inizio.")
+            else:
+                await self.speakInVC("Non c'è nessuna canzone in riproduzione da riavviare.")
+            return
+
+        if action == "clear_queue":
+            removed = self.clearUpcomingQueue()
+            if removed > 0:
+                await self.speakInVC(f"Ho rimosso {removed} brani dalla coda.")
+            else:
+                await self.speakInVC("La coda è già vuota.")
+            return
+
+        if action == "autoplay":
+            enabled = await self.setAutoplay()
+            msg = (
+                "Modalità autoplay attivata. Riproduzione continua di brani simili attiva."
+                if enabled
+                else "Modalità autoplay disattivata."
+            )
+            await self.speakInVC(msg)
             return
 
         if action == "pause":
@@ -979,11 +1089,10 @@ class MusicController:
                 logging.error(e)
                 continue
 
-    async def handleYoutubeSearch(self, user, query):
+    async def _prepareSearchSong(self, user, query: str) -> Optional[Song]:
         """
-        Cerca il brano prima nel catalogo ufficiale di Spotify (per ottenere titolo esatto,
-        artista, durata ufficiale e copertina album ed escludere qualsiasi video di YouTuber),
-        e poi scarica la traccia audio corrispondente da YouTube Music / SoundCloud.
+        Risolve il brano tramite il catalogo ufficiale di Spotify e scarica il file audio
+        senza avviare ancora il player (usato per il pre-caricamento parallelo durante il TTS).
         """
         effective_query = query
         expected_duration = None
@@ -1006,21 +1115,29 @@ class MusicController:
             logging.error(e)
             if self.textChannel:
                 await self.textChannel.send(f"❌ Impossibile cercare il brano: {e}")
-            return
+            return None
         if not result:
             if self.textChannel:
                 await self.textChannel.send("❌ Nessun brano trovato.")
-            return
+            return None
 
-        # Usa il titolo ufficiale e la copertina HD dell'album provenienti da Spotify
         if spotify_meta:
             if spotify_meta.get("full_title"):
                 result["title"] = spotify_meta["full_title"]
             if spotify_meta.get("thumbnail"):
                 result["thumbnail"] = spotify_meta["thumbnail"]
 
-        youtubeSong = self._build_song_from_result(result, user)
-        await self.queueSong(youtubeSong)
+        return self._build_song_from_result(result, user)
+
+    async def handleYoutubeSearch(self, user, query):
+        """
+        Cerca il brano prima nel catalogo ufficiale di Spotify (per ottenere titolo esatto,
+        artista, durata ufficiale e copertina album ed escludere qualsiasi video di YouTuber),
+        e poi scarica la traccia audio corrispondente da YouTube Music / SoundCloud.
+        """
+        youtubeSong = await self._prepareSearchSong(user, query)
+        if youtubeSong:
+            await self.queueSong(youtubeSong)
 
     async def queueSong(self, song: Song):
         if not self.songQueue:
@@ -1060,6 +1177,27 @@ class MusicController:
 
     async def playSong(self):
         if not self.songQueue:
+            # Se Autoplay è attivo e abbiamo appena finito un brano, cerca automaticamente un brano correlato su Spotify
+            if self.isAutoplay and self._last_seed_song and self.isConnectedToVC():
+                seed_title, seed_user = self._last_seed_song
+                self._last_seed_song = None
+                try:
+                    related = await self.spotify.getRelatedTrack(
+                        seed_title, exclude_titles=self._played_history[-25:]
+                    )
+                    if related:
+                        logging.info(
+                            f"[Autoplay] Prossimo brano correlato: '{related['full_title']}'"
+                        )
+                        next_song = await self._prepareSearchSong(
+                            seed_user, related["search_query"]
+                        )
+                        if next_song:
+                            self.songQueue.append(next_song)
+                except Exception as e:
+                    logging.debug(f"Errore selezione Autoplay: {e}")
+
+        if not self.songQueue:
             self.current_audio_source = None
             self.start_time = None
             self.pause_duration = 0
@@ -1075,6 +1213,9 @@ class MusicController:
             return
 
         song = self.songQueue[0]
+        self._last_seed_song = (song.title, song.user)
+        if song.title not in self._played_history:
+            self._played_history.append(song.title)
 
         if not song.isFile:
             # Se era un file locale che è stato rimosso o uno stream URL scaduto, rigeneralo
@@ -1139,11 +1280,36 @@ class MusicController:
         self.pause_start = None
 
         if self.textChannel:
+            if song.duration > 0:
+                mins, secs = divmod(int(song.duration), 60)
+                dur_str = f"`{mins:02d}:{secs:02d}`"
+            else:
+                dur_str = "`🔴 LIVE 24/7`"
+
+            vol_pct = int(round(self.volume * 100))
+            modes = []
+            if self.isLooping:
+                modes.append("🔁 Loop")
+            if self.isAutoplay:
+                modes.append("✨ Autoplay")
+            mode_str = " • ".join(modes) if modes else "Standard"
+
             embed = discord.Embed(
-                title="🎶 In Riproduzione:",
-                description=song.title,
+                title="🎶 In Riproduzione",
+                description=f"**{song.title}**",
                 color=0xA600FF,
             )
+            embed.add_field(name="⏱️ Durata", value=dur_str, inline=True)
+            embed.add_field(name="🔊 Volume", value=f"`{vol_pct}%`", inline=True)
+            embed.add_field(
+                name="👤 Richiesto da",
+                value=getattr(song.user, "mention", song.user.display_name),
+                inline=True,
+            )
+            if len(self.songQueue) > 1 or modes:
+                embed.set_footer(
+                    text=f"Modalità: {mode_str} • Brani in coda: {max(0, len(self.songQueue) - 1)}"
+                )
             if song.thumbnail:
                 embed.set_thumbnail(url=song.thumbnail)
             await self.textChannel.send(embed=embed, view=MusicButtons(client=self.client))

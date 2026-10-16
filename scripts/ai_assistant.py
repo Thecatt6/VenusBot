@@ -137,14 +137,44 @@ class AIAssistant:
         ):
             return AssistantResponse(action="skip", voice_reply="Salto il brano.")
 
-        # 4. Stop / Ferma tutto
+        # 4. Svuota solo la coda (senza fermare il brano attuale)
         if re.match(
-            r"^(?:stop|stoppa(?:\s+tutto)?|ferma(?:\s+tutto|\s+la\s+musica|\s+la\s+riproduzione)?|basta(?:\s+musica|\s+così)?|svuota(?:\s+la)?\s+coda|cancella(?:\s+la)?\s+coda|spegni(?:\s+la)?\s+musica)$",
+            r"^(?:svuota(?:\s+la)?\s+coda|cancella(?:\s+la)?\s+coda|pulisci(?:\s+la)?\s+coda)$",
+            lower,
+        ):
+            return AssistantResponse(
+                action="clear_queue",
+                voice_reply="Ho svuotato la coda di riproduzione.",
+            )
+
+        # 5. Stop / Ferma tutto
+        if re.match(
+            r"^(?:stop|stoppa(?:\s+tutto)?|ferma(?:\s+tutto|\s+la\s+musica|\s+la\s+riproduzione)?|basta(?:\s+musica|\s+così)?|spegni(?:\s+la)?\s+musica)$",
             lower,
         ):
             return AssistantResponse(
                 action="stop",
                 voice_reply="Fermo la musica e svuoto la coda.",
+            )
+
+        # 6. Replay / Ricomincia da capo
+        if re.match(
+            r"^(?:ricomincia(?:\s+la\s+canzone|\s+il\s+brano|\s+da\s+capo)?|rimetti(?:\s+da\s+capo|\s+dall'inizio)|da\s+capo|dall'inizio|replay|restart)$",
+            lower,
+        ):
+            return AssistantResponse(
+                action="replay",
+                voice_reply="Rimetto il brano dall'inizio.",
+            )
+
+        # 7. Autoplay (riproduzione automatica di brani correlati)
+        if re.match(
+            r"^(?:(?:attiva|disattiva|metti|togli)\s+(?:l')?autoplay|autoplay|riproduzione\s+automatica)$",
+            lower,
+        ):
+            return AssistantResponse(
+                action="autoplay",
+                voice_reply="",
             )
 
         # 5. Loop / Ripetizione
@@ -322,7 +352,7 @@ class AIAssistant:
             "usando il formato 'Artista - Titolo Canzone'. NON cercare MAI video di YouTuber, gameplay o vlog: solo vere canzoni!\n\n"
             "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido:\n"
             "{\n"
-            '  "action": "none" | "play" | "pause" | "resume" | "skip" | "stop" | "loop" | "shuffle" | "volume_up" | "volume_down" | "volume_set" | "now_playing" | "disconnect",\n'
+            '  "action": "none" | "play" | "pause" | "resume" | "skip" | "stop" | "replay" | "clear_queue" | "autoplay" | "loop" | "shuffle" | "volume_up" | "volume_down" | "volume_set" | "now_playing" | "disconnect",\n'
             '  "query": "Artista - Titolo Canzone (solo se action è play) oppure numero 1-100 (solo se action è volume_set), altrimenti stringa vuota",\n'
             '  "voice_reply": "Risposta parlata in italiano naturale e concisa (1-2 frasi brevi), senza asterischi o markdown."\n'
             "}"

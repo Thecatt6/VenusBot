@@ -674,6 +674,42 @@ async def loop(interaction: discord.Interaction):
         await interaction.response.send_message("🔁 Ripetizione (Loop) disattivata.")
 
 
+@bot.tree.command(
+    name="autoplay",
+    description="Attiva/Disattiva l'Autoplay (riproduce automaticamente brani simili da Spotify a fine coda).",
+)
+async def autoplay(interaction: discord.Interaction):
+    if await _check_banned(interaction):
+        return
+
+    musicController = await bot.getGuildMusicController(guild=interaction.guild)
+    enabled = await musicController.setAutoplay()
+    if enabled:
+        await interaction.response.send_message(
+            "✨ **Autoplay attivato!** Quando la coda terminerà, riprodurrò automaticamente brani correlati da Spotify."
+        )
+    else:
+        await interaction.response.send_message("✨ **Autoplay disattivato.**")
+
+
+@bot.tree.command(
+    name="replay",
+    description="Riavvia il brano attualmente in riproduzione dall'inizio (0:00).",
+)
+async def replay(interaction: discord.Interaction):
+    if await _check_banned(interaction):
+        return
+
+    musicController = await bot.getGuildMusicController(guild=interaction.guild)
+    ok = await musicController.replaySong()
+    if ok:
+        await interaction.response.send_message("⏮️ Brano riavviato dall'inizio.")
+    else:
+        await interaction.response.send_message(
+            "⚠️ Nessun brano attualmente in riproduzione.", ephemeral=True
+        )
+
+
 @bot.tree.command(name="queue", description="Mostra e gestisce la coda di riproduzione.")
 async def queue(interaction: discord.Interaction):
     if await _check_banned(interaction):
@@ -829,7 +865,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="🎵 Comandi Musicali",
         value=(
             "`/play` • `/playfile` • `/search` • `/queue` • `/pause` • `/resume`\n"
-            "`/skip` • `/stop` • `/loop` • `/shuffle` • `/volume` • `/time`\n"
+            "`/skip` • `/stop` • `/replay` • `/loop` • `/autoplay` • `/shuffle` • `/volume` • `/time`\n"
             "`/247` • `/dc` • `/lofi` • `/lofijazz` • `/synthwave`"
         ),
         inline=False,
