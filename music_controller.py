@@ -878,10 +878,13 @@ class MusicController:
             return
 
         artist = spotifySongInfo.get("artist", "")
-        query = f"{spotifySongInfo['title']} {artist}".strip()
+        query = f"{artist} - {spotifySongInfo['title']}".strip(" -")
+        expected_dur = spotifySongInfo.get("duration")
         searcher = VideoSearcher()
         try:
-            result = await searcher.getVideoInfoFromQuery(query)
+            result = await searcher.getVideoInfoFromQuery(
+                query, expected_duration=expected_dur
+            )
         except Exception as e:
             logging.error(e)
             if self.textChannel:
@@ -891,6 +894,10 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Brano non trovato.")
             return
+        if spotifySongInfo.get("thumbnail"):
+            result["thumbnail"] = spotifySongInfo["thumbnail"]
+        if artist and spotifySongInfo.get("title"):
+            result["title"] = f"{artist} - {spotifySongInfo['title']}"
         youtubeSong = self._build_song_from_result(result, user)
         await self.queueSong(youtubeSong)
 
@@ -973,9 +980,28 @@ class MusicController:
                 continue
 
     async def handleYoutubeSearch(self, user, query):
+        """
+        Cerca il brano prima nel catalogo ufficiale di Spotify (per ottenere titolo esatto,
+        artista, durata ufficiale e copertina album ed escludere qualsiasi video di YouTuber),
+        e poi scarica la traccia audio corrispondente da YouTube Music / SoundCloud.
+        """
+        effective_query = query
+        expected_duration = None
+        spotify_meta = None
+
+        try:
+            spotify_meta = await self.spotify.searchTrack(query)
+            if spotify_meta:
+                effective_query = spotify_meta["search_query"]
+                expected_duration = spotify_meta.get("duration")
+        except Exception as e:
+            logging.debug(f"Ricerca preventiva Spotify non riuscita: {e}")
+
         searcher = VideoSearcher()
         try:
-            result = await searcher.getVideoInfoFromQuery(query)
+            result = await searcher.getVideoInfoFromQuery(
+                effective_query, expected_duration=expected_duration
+            )
         except Exception as e:
             logging.error(e)
             if self.textChannel:
@@ -985,6 +1011,14 @@ class MusicController:
             if self.textChannel:
                 await self.textChannel.send("❌ Nessun brano trovato.")
             return
+
+        # Usa il titolo ufficiale e la copertina HD dell'album provenienti da Spotify
+        if spotify_meta:
+            if spotify_meta.get("full_title"):
+                result["title"] = spotify_meta["full_title"]
+            if spotify_meta.get("thumbnail"):
+                result["thumbnail"] = spotify_meta["thumbnail"]
+
         youtubeSong = self._build_song_from_result(result, user)
         await self.queueSong(youtubeSong)
 

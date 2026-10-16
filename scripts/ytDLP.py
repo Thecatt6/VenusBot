@@ -64,7 +64,9 @@ NON_MUSIC_BLACKLIST = (
 )
 
 
-def _score_music_candidate(entry: dict, original_query: str) -> int:
+def _score_music_candidate(
+    entry: dict, original_query: str, expected_duration: Optional[int] = None
+) -> int:
     """
     Calcola un punteggio per distinguere un vero brano musicale da un video di YouTuber.
     Restituisce un punteggio negativo se il video non è musicale.
@@ -84,6 +86,16 @@ def _score_music_candidate(entry: dict, original_query: str) -> int:
             return -100
 
     score = 0
+    # Se conosciamo la durata esatta del brano da Spotify, premia i risultati con durata quasi identica
+    if expected_duration and expected_duration > 0 and duration > 0:
+        diff = abs(duration - expected_duration)
+        if diff <= 8:
+            score += 45
+        elif diff <= 20:
+            score += 25
+        elif diff > 90:
+            score -= 40
+
     # Canali ufficiali di YouTube Music ("Artista - Topic") o VEVO hanno priorità assoluta
     if "- topic" in channel or "vevo" in channel:
         score += 50
@@ -135,7 +147,9 @@ class VideoSearcher:
             opts["cookiefile"] = str(self.cookies_path)
         return opts
 
-    def _select_best_music_candidate(self, query: str) -> Tuple[str, str]:
+    def _select_best_music_candidate(
+        self, query: str, expected_duration: Optional[int] = None
+    ) -> Tuple[str, str]:
         """
         Cerca su YouTube filtrando esclusivamente brani musicali (Topic, VEVO, Official Audio)
         ed escludendo video di YouTuber, gameplay o vlog.
@@ -162,7 +176,7 @@ class VideoSearcher:
                 if entries:
                     scored = sorted(
                         entries,
-                        key=lambda e: _score_music_candidate(e, query),
+                        key=lambda e: _score_music_candidate(e, query, expected_duration),
                         reverse=True,
                     )
                     best = scored[0]
@@ -324,7 +338,12 @@ class VideoSearcher:
 
         return None
 
-    def _download_or_extract(self, target: str, is_search: bool = False) -> Optional[dict]:
+    def _download_or_extract(
+        self,
+        target: str,
+        is_search: bool = False,
+        expected_duration: Optional[int] = None,
+    ) -> Optional[dict]:
         """
         Pipeline di estrazione audio a 3 livelli (100% anti-403):
         1. YouTube con client predefiniti yt-dlp 2026 ('tv', 'android_sdkless', 'web')
@@ -333,7 +352,9 @@ class VideoSearcher:
         """
         fallback_query = target
         if is_search:
-            resolved_target, fallback_query = self._select_best_music_candidate(target)
+            resolved_target, fallback_query = self._select_best_music_candidate(
+                target, expected_duration=expected_duration
+            )
         else:
             resolved_target = target
 
@@ -386,11 +407,15 @@ class VideoSearcher:
 
     async def getVideoInfoFromURL(self, video_url: str):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._download_or_extract, video_url, False)
+        return await loop.run_in_executor(None, self._download_or_extract, video_url, False, None)
 
-    async def getVideoInfoFromQuery(self, video_query: str):
+    async def getVideoInfoFromQuery(
+        self, video_query: str, expected_duration: Optional[int] = None
+    ):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._download_or_extract, video_query, True)
+        return await loop.run_in_executor(
+            None, self._download_or_extract, video_query, True, expected_duration
+        )
 
     async def getSearchResults(self, video_query: str):
         loop = asyncio.get_running_loop()

@@ -4,6 +4,7 @@ import re
 from dotenv import load_dotenv
 from pathlib import Path
 import logging
+from typing import Optional
 
 
 class SpotifyController:
@@ -13,42 +14,150 @@ class SpotifyController:
         self.__client_secret = (os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip().strip("'\"")
         self.__refresh_token = (os.getenv("SPOTIFY_CLIENT_REFRESH_TOKEN") or "").strip().strip("'\"")
         self.__token_url = "https://accounts.spotify.com/api/token"
-        self.__access_token = None
+        self.__access_token: Optional[str] = None
 
-    def __get_payload(self):
-        if self.__refresh_token:
-            return {
-                "grant_type": "refresh_token",
-                "refresh_token": self.__refresh_token,
+    def is_configured(self) -> bool:
+        return bool(self.__client_id and self.__client_secret)
+
+    async def refresh_token(self) -> Optional[str]:
+        if not self.__client_id or not self.__client_secret:
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            # 1. Prova prima con refresh_token se presente
+            if self.__refresh_token:
+                payload_rt = {
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.__refresh_token,
+                    "client_id": self.__client_id,
+                    "client_secret": self.__client_secret,
+                }
+                try:
+                    async with session.post(
+                        self.__token_url,
+                        data=payload_rt,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.__access_token = data.get("access_token")
+                            if self.__access_token:
+                                logging.debug("Token Spotify aggiornato (refresh_token).")
+                                return self.__access_token
+                except Exception as e:
+                    logging.debug(f"Errore refresh_token Spotify: {e}")
+
+            # 2. Fallback standard Client Credentials (funziona sempre con CLIENT_ID + CLIENT_SECRET)
+            payload_cc = {
+                "grant_type": "client_credentials",
                 "client_id": self.__client_id,
                 "client_secret": self.__client_secret,
             }
-        return {
-            "grant_type": "client_credentials",
-            "client_id": self.__client_id,
-            "client_secret": self.__client_secret,
-        }
+            try:
+                async with session.post(
+                    self.__token_url,
+                    data=payload_cc,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self.__access_token = data.get("access_token")
+                        if self.__access_token:
+                            logging.debug("Token Spotify ottenuto (client_credentials).")
+                            return self.__access_token
+                    else:
+                        text = await response.text()
+                        logging.warning(f"Autenticazione Spotify fallita ({response.status}): {text}")
+            except Exception as e:
+                logging.debug(f"Errore client_credentials Spotify: {e}")
 
-    async def refresh_token(self):
-        if not self.__client_id or not self.__client_secret:
-            return None
-        payload = self.__get_payload()
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.__token_url, data=payload) as response:
-                if response.status == 200:
-                    logging.debug("Token Spotify aggiornato con successo.")
-                    data = await response.json()
-                    self.__access_token = data.get("access_token")
-                    return self.__access_token
-                else:
-                    text = await response.text()
-                    logging.debug(f"Impossibile aggiornare token Spotify: {response.status} - {text}")
-                    return None
+        return None
 
-    async def get_access_token(self):
+    async def get_access_token(self) -> Optional[str]:
         if self.__access_token is None:
             return await self.refresh_token()
         return self.__access_token
+
+    async def searchTrack(self, query: str) -> Optional[dict]:
+        """
+        Cerca il brano direttamente nel catalogo ufficiale di Spotify (esclusivamente musica!).
+        Restituisce titolo ufficiale, artista, copertina album, durata esatta e link Spotify.
+        """
+        if not self.is_configured() or not query or not query.strip():
+            return None
+
+        clean_query = re.sub(
+            r"\b(official\s+audio|official\s+video|lyrics|audio\s+ufficiale)\b",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not clean_query:
+            clean_query = query.strip()
+
+        access_token = await self.get_access_token()
+        if not access_token:
+            return None
+
+        search_url = "https://api.spotify.com/v1/search"
+        params = {
+            "q": clean_query,
+            "type": "track",
+            "market": "IT",
+            "limit": "3",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(2):
+                headers = {"Authorization": f"Bearer {access_token}"}
+                try:
+                    async with session.get(
+                        search_url,
+                        headers=headers,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            items = data.get("tracks", {}).get("items", [])
+                            if not items:
+                                return None
+                            track = items[0]
+                            title = track.get("name", "")
+                            artists = [a["name"] for a in track.get("artists", []) if a.get("name")]
+                            artist_str = ", ".join(artists[:2]) if artists else ""
+                            primary_artist = artists[0] if artists else ""
+                            images = track.get("album", {}).get("images", [])
+                            thumbnail = images[0]["url"] if images else None
+                            duration_sec = int(round((track.get("duration_ms") or 0) / 1000))
+                            spotify_url = track.get("external_urls", {}).get("spotify")
+
+                            full_display = f"{artist_str} - {title}" if artist_str else title
+                            search_query = f"{primary_artist} - {title}" if primary_artist else title
+
+                            logging.info(
+                                f"[Catalogo Spotify] Trovato brano ufficiale: '{full_display}' ({duration_sec}s)"
+                            )
+                            return {
+                                "title": title,
+                                "artist": primary_artist,
+                                "full_title": full_display,
+                                "search_query": search_query,
+                                "thumbnail": thumbnail,
+                                "duration": duration_sec,
+                                "spotify_url": spotify_url,
+                            }
+                        elif resp.status == 401 and attempt == 0:
+                            access_token = await self.refresh_token()
+                            if not access_token:
+                                break
+                        else:
+                            break
+                except Exception as e:
+                    logging.debug(f"Errore ricerca catalogo Spotify: {e}")
+                    break
+
+        return None
 
     def extract_track_id(self, spotify_url: str) -> str:
         match = re.search(r"spotify\.com/(?:intl-[a-z]+/)?track/([a-zA-Z0-9]+)", spotify_url)
@@ -68,8 +177,9 @@ class SpotifyController:
                     if resp.status == 200:
                         data = await resp.json()
                         title = data.get("title")
+                        thumbnail = data.get("thumbnail_url")
                         if title:
-                            return {"title": title, "artist": ""}
+                            return {"title": title, "artist": "", "thumbnail": thumbnail}
         except Exception as e:
             logging.debug(f"Fallback oEmbed Spotify fallito: {e}")
         return None
@@ -81,28 +191,22 @@ class SpotifyController:
         access_token = await self.get_access_token()
         if access_token:
             async with aiohttp.ClientSession() as session:
-                headers = {"Authorization": f"Bearer {access_token}"}
-
-                async def fetch_track() -> dict | None:
+                for attempt in range(2):
+                    headers = {"Authorization": f"Bearer {access_token}"}
                     async with session.get(api_url, headers=headers) as resp:
                         if resp.status == 200:
                             data = await resp.json()
+                            images = data.get("album", {}).get("images", [])
                             return {
                                 "title": data["name"],
                                 "artist": data["artists"][0]["name"] if data.get("artists") else "",
+                                "thumbnail": images[0]["url"] if images else None,
+                                "duration": int(round((data.get("duration_ms") or 0) / 1000)),
                             }
-                        return None
-
-                result = await fetch_track()
-                if result is not None:
-                    return result
-
-                access_token = await self.refresh_token()
-                if access_token:
-                    headers = {"Authorization": f"Bearer {access_token}"}
-                    result = await fetch_track()
-                    if result is not None:
-                        return result
+                        elif resp.status == 401 and attempt == 0:
+                            access_token = await self.refresh_token()
+                            if not access_token:
+                                break
 
         # Fallback oEmbed senza credenziali
         oembed_res = await self._fallback_oembed_track(spotify_url)
@@ -133,9 +237,8 @@ class SpotifyController:
             )
 
         async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {access_token}"}
-
-            async def fetch_items():
+            for attempt in range(2):
+                headers = {"Authorization": f"Bearer {access_token}"}
                 async with session.get(endpoint, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -159,16 +262,9 @@ class SpotifyController:
                             if (item.get("track") if "playlist" in endpoint else item.get("name"))
                         ]
                         return [{"title": title, "thumbnail": thumbnail}] + track_list
-                    return None
-
-            result = await fetch_items()
-            if result is not None:
-                return result
-
-            access_token = await self.refresh_token()
-            headers = {"Authorization": f"Bearer {access_token}"}
-            result = await fetch_items()
-            if result is not None:
-                return result
+                    elif resp.status == 401 and attempt == 0:
+                        access_token = await self.refresh_token()
+                        if not access_token:
+                            break
 
             raise Exception("Impossibile recuperare la playlist/album da Spotify.")
