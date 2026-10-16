@@ -1,6 +1,7 @@
 import array
 import asyncio
 import audioop
+import hashlib
 import io
 import logging
 import os
@@ -24,6 +25,7 @@ from discord.ext.voice_recv import reader as vr_reader
 from discord.ext.voice_recv import video as vr_video
 from discord.ext.voice_recv import voice_client as vr_vc
 from discord.ext.voice_recv.rtp import SilencePacket
+import requests
 import speech_recognition as sr
 
 try:
@@ -365,18 +367,32 @@ class ItalianTTSEngine:
         if not clean_text:
             return None
 
-        output_path = self.temp_dir / f"tts_{uuid.uuid4().hex[:10]}.mp3"
+        # Cache persistente su disco per voce + testo:
+        # le frasi comuni ("Dimmi pure.", "Salto il brano.", "Musica in pausa.", ecc.)
+        # vengono restituite in 0ms senza dover attendere la rete!
+        cache_key = hashlib.sha1(
+            f"{self.voice}:{clean_text.lower()}".encode("utf-8")
+        ).hexdigest()[:16]
+        cached_path = self.temp_dir / f"cached_{cache_key}.mp3"
+        if cached_path.exists() and cached_path.stat().st_size > 256:
+            return cached_path
+
+        tmp_path = self.temp_dir / f"tmp_{uuid.uuid4().hex[:10]}.mp3"
 
         if HAS_EDGE_TTS:
             try:
                 communicate = edge_tts.Communicate(
                     text=clean_text,
                     voice=self.voice,
-                    rate="+5%",
+                    rate="+8%",
                 )
-                await asyncio.wait_for(communicate.save(str(output_path)), timeout=10.0)
-                if output_path.exists() and output_path.stat().st_size > 100:
-                    return output_path
+                await asyncio.wait_for(communicate.save(str(tmp_path)), timeout=8.0)
+                if tmp_path.exists() and tmp_path.stat().st_size > 256:
+                    try:
+                        tmp_path.replace(cached_path)
+                        return cached_path
+                    except Exception:
+                        return tmp_path
             except Exception as e:
                 logging.warning(f"Edge-TTS fallito ({e}), passo al fallback gTTS...")
 
@@ -386,15 +402,39 @@ class ItalianTTSEngine:
 
                 def _run_gtts():
                     tts = gTTS(text=clean_text, lang="it", slow=False)
-                    tts.save(str(output_path))
+                    tts.save(str(tmp_path))
 
-                await asyncio.wait_for(loop.run_in_executor(None, _run_gtts), timeout=10.0)
-                if output_path.exists() and output_path.stat().st_size > 100:
-                    return output_path
+                await asyncio.wait_for(loop.run_in_executor(None, _run_gtts), timeout=8.0)
+                if tmp_path.exists() and tmp_path.stat().st_size > 256:
+                    try:
+                        tmp_path.replace(cached_path)
+                        return cached_path
+                    except Exception:
+                        return tmp_path
             except Exception as e:
                 logging.error(f"Anche il fallback gTTS è fallito: {e}")
 
         return None
+
+    async def prewarm_common_phrases(self) -> None:
+        """Pre-genera in background le risposte vocali più frequenti per risposta istantanea (0ms)."""
+        common = (
+            "Dimmi pure.",
+            "Musica in pausa.",
+            "Riprendo la musica.",
+            "Riprendo la riproduzione.",
+            "Salto il brano.",
+            "Fermo la musica e svuoto la coda.",
+            "Ho mescolato la coda di riproduzione.",
+            "Rimetto la canzone dall'inizio.",
+            "Ripetizione del brano attivata.",
+            "Ripetizione disattivata.",
+        )
+        for phrase in common:
+            try:
+                await self.synthesize_to_file(phrase)
+            except Exception:
+                pass
 
 
 class ItalianDiscordAudioSource(sr.AudioSource):
@@ -447,8 +487,11 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     SAMPLE_RATE = 48_000
     SAMPLE_WIDTH = 2
-    SILENCE_FLUSH_SECONDS = 1.15   # Attende 1.15s di silenzio prima di considerare conclusa la frase
-    MAX_PHRASE_SECONDS = 12.0      # Durata massima singola frase
+    SILENCE_FLUSH_SECONDS = 0.60   # Risposta ultra-reattiva: 0.60s di silenzio a fine frase
+    MAX_PHRASE_SECONDS = 10.0      # Durata massima singola frase
+    _HTTP_SESSION = requests.Session()
+    _GROQ_WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
+    _GROQ_WHISPER_DISABLED = False
 
     def __init__(
         self,
@@ -515,7 +558,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     def _flush_loop(self) -> None:
         while self._running:
-            time.sleep(0.10)
+            time.sleep(0.04)
             now = time.monotonic()
             to_process = []
 
@@ -572,16 +615,10 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         return None
 
     def _recognize_with_groq_whisper(self, audio: sr.AudioData) -> Optional[str]:
-        import requests
-
-        if getattr(self, "_groq_whisper_disabled", False):
+        if ItalianSpeechSink._GROQ_WHISPER_DISABLED:
             return None
 
-        whisper_models = getattr(
-            self,
-            "_groq_whisper_models",
-            ["whisper-large-v3-turbo", "whisper-large-v3"],
-        )
+        whisper_models = ItalianSpeechSink._GROQ_WHISPER_MODELS
 
         # Prompt che guida Whisper a riconoscere comandi italiani + titoli di canzoni in inglese e italiano
         bilingual_prompt = (
@@ -593,7 +630,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         try:
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
             for w_model in list(whisper_models):
-                resp = requests.post(
+                resp = ItalianSpeechSink._HTTP_SESSION.post(
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {self.groq_api_key}"},
                     files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
@@ -604,7 +641,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                         "response_format": "json",
                         "temperature": "0.0",
                     },
-                    timeout=6,
+                    timeout=4,
                 )
                 if resp.status_code == 200:
                     payload = resp.json()
@@ -622,9 +659,8 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 elif resp.status_code in (403, 404):
                     if w_model in whisper_models:
                         whisper_models.remove(w_model)
-                    self._groq_whisper_models = whisper_models
                     if not whisper_models:
-                        self._groq_whisper_disabled = True
+                        ItalianSpeechSink._GROQ_WHISPER_DISABLED = True
                     continue
                 else:
                     break

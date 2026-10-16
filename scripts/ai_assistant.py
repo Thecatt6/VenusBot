@@ -39,14 +39,71 @@ ITALIAN_WEEKDAYS = [
     "domenica",
 ]
 
+ITALIAN_WORD_NUMBERS = {
+    "zero": 0,
+    "cinque": 5,
+    "dieci": 10,
+    "quindici": 15,
+    "venti": 20,
+    "venticinque": 25,
+    "trenta": 30,
+    "trentacinque": 35,
+    "quaranta": 40,
+    "quarantacinque": 45,
+    "cinquanta": 50,
+    "meta": 50,
+    "metà": 50,
+    "cinquantacinque": 55,
+    "sessanta": 60,
+    "sessantacinque": 65,
+    "settanta": 70,
+    "settantacinque": 75,
+    "ottanta": 80,
+    "ottantacinque": 85,
+    "novanta": 90,
+    "novantacinque": 95,
+    "cento": 100,
+    "massimo": 100,
+    "minimo": 15,
+}
+
+# Correzioni fonetiche istantanee in locale (0ms) per i titoli/artisti inglesi più comuni
+LOCAL_PHONETIC_FIXES = {
+    "blanding laits": "The Weeknd - Blinding Lights",
+    "blinding laits": "The Weeknd - Blinding Lights",
+    "blanding light": "The Weeknd - Blinding Lights",
+    "starboi": "The Weeknd - Starboy",
+    "boemian rapsodi": "Queen - Bohemian Rhapsody",
+    "bohemian rapsodi": "Queen - Bohemian Rhapsody",
+    "smels laik tin spirit": "Nirvana - Smells Like Teen Spirit",
+    "fein": "Travis Scott - FE!N",
+    "fin": "Travis Scott - FE!N",
+    "ander presciur": "Queen - Under Pressure",
+    "hotel california": "Eagles - Hotel California",
+    "biliv": "Cher - Believe",
+    "auan mor taim": "Daft Punk - One More Time",
+    "get lachi": "Daft Punk - Get Lucky",
+    "sceip of iu": "Ed Sheeran - Shape of You",
+    "shape of iu": "Ed Sheeran - Shape of You",
+    "beliver": "Imagine Dragons - Believer",
+    "ander de brig": "Red Hot Chili Peppers - Under the Bridge",
+}
+
+# Pattern che indicano una richiesta discorsiva/vaga ("metti una canzone triste anni 80")
+# che beneficia davvero dell'LLM per scegliere un titolo specifico
+VAGUE_PLAY_PATTERNS = re.compile(
+    r"\b(?:qualcosa\s+di|una\s+canzone\s+(?:triste|allegra|rilassante|romantica|energica|tranquilla|anni\s+\d+)|un\s+brano\s+(?:triste|allegro|rilassante)|consigliami|scegli\s+tu|a\s+caso| a\s+tua\s+scelta)\b",
+    flags=re.IGNORECASE,
+)
+
 PREFERRED_GROQ_CHAT_MODELS = [
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
-    "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
     "gemma2-9b-it",
 ]
 
@@ -59,6 +116,27 @@ def get_italian_datetime_str() -> str:
     weekday = ITALIAN_WEEKDAYS[now.weekday()]
     month = ITALIAN_MONTHS[now.month]
     return f"{weekday} {now.day} {month} {now.year}, ore {now.strftime('%H:%M')}"
+
+
+def _normalize_command_text(text: str) -> str:
+    """
+    Pulisce il testo rimuovendo formule di cortesia e riempitivi ("per favore", "puoi", "grazie", ecc.)
+    per permettere il riconoscimento locale istantaneo in <0.2ms senza passare per l'LLM.
+    """
+    s = re.sub(r"[.!?]+$", "", text.strip().lower()).strip()
+    # Rimuovi suffissi di cortesia
+    s = re.sub(
+        r"\s+(?:per\s+favore|per\s+piacere|per\s+cortesia|cortesemente|grazie(?:\s+mille)?|adesso|ora|subito|un\s+attimo)$",
+        "",
+        s,
+    ).strip()
+    # Rimuovi prefissi di cortesia
+    s = re.sub(
+        r"^(?:per\s+favore|per\s+piacere|cortesemente|mi\s+puoi|puoi|potresti|vorrei\s+che|riesci\s+a|fai)\s+",
+        "",
+        s,
+    ).strip()
+    return s
 
 
 class AssistantResponse:
@@ -82,11 +160,11 @@ class AssistantResponse:
 
 class AIAssistant:
     """
-    Cervello intelligente in stile Google Assistant per VenusBot.
-    - Riconosce istantaneamente i comandi di controllo (pausa, salta, stop, volume, ora/data)
-    - Corregge foneticamente i titoli di canzoni in inglese e italiano pronunciati a voce
-      (es. "blanding laits" -> "The Weeknd - Blinding Lights")
-    - Risponde a qualsiasi domanda generale parlando nel canale vocale.
+    Motore ibrido Ultra-Rapido per VenusBot:
+    1. Elaborazione LOCALE ISTANTANEA (< 0.2ms, zero LLM) per TUTTI i comandi musicali,
+       richieste di canzoni, controllo volume, radio, orario, data e saluti.
+    2. Fallback Cloud AI (Groq / Gemini / Pollinations) usato SOLO per vere domande
+       enciclopediche/generali o richieste musicali astratte ("metti qualcosa di rilassante").
     """
 
     def __init__(self):
@@ -97,18 +175,26 @@ class AIAssistant:
         self.gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 
         self._discovered_groq_models: Optional[List[str]] = None
-        self._history: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=12))
+        self._history: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=10))
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=8)
+            )
+        return self._http_session
 
     def clear_history(self, guild_id: int) -> None:
         self._history.pop(guild_id, None)
 
     def _match_fast_command(self, text: str) -> Optional[AssistantResponse]:
         """
-        Comandi di controllo istantaneo che non richiedono correzione fonetica di titoli musicali.
+        Elaborazione 100% LOCALE (< 0.2ms) per tutti i comandi comuni e le richieste musicali dirette,
+        evitando completamente la latenza dell'LLM.
         """
         raw = text.strip()
-        clean = re.sub(r"[.!?]+$", "", raw).strip()
-        lower = clean.lower()
+        lower = _normalize_command_text(raw)
 
         if not lower:
             return AssistantResponse(
@@ -116,30 +202,30 @@ class AIAssistant:
                 voice_reply="Dimmi pure.",
             )
 
-        # 1. Pausa
+        # 1. Pausa (anche con varianti verbali come "mettere in pausa", "metti in pausa la musica")
         if re.match(
-            r"^(?:metti\s+in\s+pausa|pausa|pause|ferma\s+un\s+attimo|aspetta\s+un\s+attimo)$",
+            r"^(?:(?:metti|mettere)\s+in\s+pausa(?:\s+la\s+musica|\s+la\s+canzone|\s+il\s+brano)?|pausa(?:\s+la\s+musica|\s+la\s+canzone)?|pause|ferma\s+un\s+attimo|aspetta(?:\s+un\s+attimo)?)$",
             lower,
         ):
-            return AssistantResponse(action="pause", voice_reply="Metto in pausa.")
+            return AssistantResponse(action="pause", voice_reply="Musica in pausa.")
 
         # 2. Riprendi / Resume
         if re.match(
-            r"^(?:riprendi(?:\s+la\s+musica|\s+la\s+riproduzione|\s+pure)?|continua(?:\s+la\s+musica)?|fai\s+ripartire|togli\s+(?:la\s+)?pausa|resume|riproduci|play)$",
+            r"^(?:(?:riprendi|riprendere)(?:\s+la\s+musica|\s+la\s+riproduzione|\s+la\s+canzone|\s+pure)?|(?:continua|continuare)(?:\s+la\s+musica|\s+ a\s+suonare)?|(?:fai\s+)?ripartire(?:\s+la\s+musica|\s+la\s+canzone)?|(?:togli|togliere)\s+(?:la\s+)?pausa|resume|riproduci|play)$",
             lower,
         ):
-            return AssistantResponse(action="resume", voice_reply="Riprendo la riproduzione.")
+            return AssistantResponse(action="resume", voice_reply="Riprendo la musica.")
 
-        # 3. Skip / Salta
+        # 3. Skip / Salta / Cambia canzone
         if re.match(
-            r"^(?:salta(?:\s+canzone|\s+la\s+canzone|\s+il\s+brano|\s+brano|\s+questa)?|skippa|skip|avanti|vai\s+avanti|prossima(?:\s+canzone)?|prossimo(?:\s+brano)?|next|cambia(?:\s+canzone|\s+brano|\s+musica)?)$",
+            r"^(?:(?:salta|saltare|skippa|skippare)(?:\s+questa)?(?:\s+canzone|\s+la\s+canzone|\s+il\s+brano|\s+brano|\s+traccia)?|skip|avanti|vai\s+avanti|(?:vai\s+alla\s+)?prossima(?:\s+canzone|\s+traccia)?|prossimo(?:\s+brano)?|next|(?:cambia|cambiare)(?:\s+canzone|\s+brano|\s+musica|\s+traccia)?)$",
             lower,
         ):
             return AssistantResponse(action="skip", voice_reply="Salto il brano.")
 
-        # 4. Svuota solo la coda (senza fermare il brano attuale)
+        # 4. Svuota solo la coda
         if re.match(
-            r"^(?:svuota(?:\s+la)?\s+coda|cancella(?:\s+la)?\s+coda|pulisci(?:\s+la)?\s+coda)$",
+            r"^(?:(?:svuota|svuotare|cancella|cancellare|pulisci|pulire)\s+(?:la\s+)?coda)$",
             lower,
         ):
             return AssistantResponse(
@@ -149,7 +235,7 @@ class AIAssistant:
 
         # 5. Stop / Ferma tutto
         if re.match(
-            r"^(?:stop|stoppa(?:\s+tutto)?|ferma(?:\s+tutto|\s+la\s+musica|\s+la\s+riproduzione)?|basta(?:\s+musica|\s+così)?|spegni(?:\s+la)?\s+musica)$",
+            r"^(?:stop|(?:stoppa|stoppare)(?:\s+tutto|\s+la\s+musica)?|(?:ferma|fermare)(?:\s+tutto|\s+la\s+musica|\s+la\s+riproduzione|\s+la\s+canzone)?|basta(?:\s+musica|\s+così|\s+canzoni)?|(?:spegni|spegnere)(?:\s+la)?\s+musica)$",
             lower,
         ):
             return AssistantResponse(
@@ -159,79 +245,125 @@ class AIAssistant:
 
         # 6. Replay / Ricomincia da capo
         if re.match(
-            r"^(?:ricomincia(?:\s+la\s+canzone|\s+il\s+brano|\s+da\s+capo)?|rimetti(?:\s+da\s+capo|\s+dall'inizio)|da\s+capo|dall'inizio|replay|restart)$",
+            r"^(?:(?:ricomincia|ricominciare)(?:\s+la\s+canzone|\s+il\s+brano|\s+da\s+capo)?|(?:rimetti|rimettere)(?:\s+da\s+capo|\s+dall'inizio|\s+la\s+canzone)|da\s+capo|dall'inizio|replay|restart)$",
             lower,
         ):
             return AssistantResponse(
                 action="replay",
-                voice_reply="Rimetto il brano dall'inizio.",
+                voice_reply="Rimetto la canzone dall'inizio.",
             )
 
-        # 7. Autoplay (riproduzione automatica di brani correlati)
+        # 7. Autoplay
         if re.match(
-            r"^(?:(?:attiva|disattiva|metti|togli)\s+(?:l')?autoplay|autoplay|riproduzione\s+automatica)$",
+            r"^(?:(?:attiva|attivare|disattiva|disattivare|metti|togli)\s+(?:l')?autoplay|autoplay|riproduzione\s+automatica)$",
             lower,
         ):
-            return AssistantResponse(
-                action="autoplay",
-                voice_reply="",
-            )
+            return AssistantResponse(action="autoplay", voice_reply="")
 
-        # 5. Loop / Ripetizione
+        # 8. Loop / Ripetizione
         if re.match(
-            r"^(?:metti\s+in\s+loop|togli\s+(?:il\s+)?loop|loop|ripeti(?:\s+la\s+canzone|\s+canzone|\s+il\s+brano|\s+brano)?|ripetizione)$",
+            r"^(?:(?:metti|mettere)\s+in\s+loop|(?:togli|togliere)\s+(?:il\s+)?loop|loop|(?:ripeti|ripetere)(?:\s+la\s+canzone|\s+canzone|\s+il\s+brano|\s+brano|\s+sempre)?|ripetizione)$",
             lower,
         ):
             return AssistantResponse(action="loop", voice_reply="")
 
-        # 6. Shuffle / Mescola
+        # 9. Shuffle / Mescola
         if re.match(
-            r"^(?:mescola(?:\s+la\s+coda|\s+le\s+canzoni)?|mischia(?:\s+la\s+coda|\s+le\s+canzoni)?|shuffle|riproduzione\s+casuale|ordine\s+casuale)$",
+            r"^(?:(?:mescola|mescolare|mischia|mischiare)(?:\s+la\s+coda|\s+le\s+canzoni|\s+i\s+brani)?|shuffle|riproduzione\s+casuale|ordine\s+casuale)$",
             lower,
         ):
             return AssistantResponse(
                 action="shuffle",
-                voice_reply="Ho mescolato le canzoni in coda.",
+                voice_reply="Ho mescolato la coda di riproduzione.",
             )
 
-        # 7. Volume
-        m_vol_set = re.match(
-            r"^(?:imposta\s+(?:il\s+)?volume\s+(?:a|al)|metti\s+(?:il\s+)?volume\s+(?:a|al)|volume\s+(?:a|al)?)\s*(\d{1,3})\s*%?$",
+        # 10. Volume (supporta sia cifre "50" sia parole italiane "cinquanta", "metà", "massimo")
+        m_vol_num = re.search(
+            r"^(?:(?:imposta|impostare|metti|mettere|porta|portare|abbassa|alza)\s+(?:il\s+)?)?volume\s+(?:a|al|su)?\s*(\d{1,3})\s*(?:%|percento)?$",
             lower,
         )
-        if m_vol_set:
-            vol = max(1, min(100, int(m_vol_set.group(1))))
+        if m_vol_num:
+            vol = max(5, min(150, int(m_vol_num.group(1))))
             return AssistantResponse(
                 action="volume_set",
                 query=str(vol),
-                voice_reply=f"Imposto il volume al {vol} percento.",
+                voice_reply=f"Volume impostato al {vol} percento.",
             )
 
-        if re.match(r"^(?:alza(?:\s+un\s+po')?\s+(?:il\s+)?volume|più\s+forte|alza\s+la\s+musica)$", lower):
+        for word_num, val in ITALIAN_WORD_NUMBERS.items():
+            if re.search(
+                rf"^(?:(?:imposta|metti|porta)\s+(?:il\s+)?)?volume\s+(?:a|al|su|alla)?\s*{re.escape(word_num)}$",
+                lower,
+            ):
+                return AssistantResponse(
+                    action="volume_set",
+                    query=str(val),
+                    voice_reply=f"Volume impostato al {val} percento.",
+                )
+
+        if re.match(
+            r"^(?:(?:alza|alzare|aumenta|aumentare)(?:\s+un\s+po'|\s+un\s+pochino|\s+tanto)?(?:\s+il\s+volume|\s+la\s+musica|\s+la\s+voce)?|più\s+forte|volume\s+su)$",
+            lower,
+        ):
             return AssistantResponse(action="volume_up", voice_reply="Alzo il volume.")
 
-        if re.match(r"^(?:abbassa(?:\s+un\s+po')?\s+(?:il\s+)?volume|più\s+piano|abbassa\s+la\s+musica)$", lower):
+        if re.match(
+            r"^(?:(?:abbassa|abbassare|diminuisci|riduci)(?:\s+un\s+po'|\s+un\s+pochino|\s+tanto)?(?:\s+il\s+volume|\s+la\s+musica|\s+la\s+voce)?|più\s+piano|volume\s+giù)$",
+            lower,
+        ):
             return AssistantResponse(action="volume_down", voice_reply="Abbasso il volume.")
 
-        # 8. Che canzone sta suonando?
+        # 11. Che canzone sta suonando?
         if re.match(
-            r"^(?:che\s+canzone\s+(?:e|è)(?:\s+questa)?|cosa\s+sta\s+(?:suonando|andando)|come\s+si\s+chiama\s+(?:questa\s+canzone|questo\s+brano)|chi\s+canta(?:\s+questa\s+canzone)?|che\s+brano\s+(?:e|è))$",
+            r"^(?:che\s+(?:canzone|brano)\s+(?:e|è)(?:\s+questa|\s+questo)?|(?:che\s+(?:canzone|brano|musica)|cosa)\s+sta\s+(?:suonando|andando|riproducendo)|come\s+si\s+chiama\s+(?:questa\s+canzone|questo\s+brano|la\s+canzone)|chi\s+canta(?:\s+questa\s+canzone)?|titolo(?:\s+della\s+canzone)?)$",
             lower,
         ):
             return AssistantResponse(action="now_playing")
 
-        # 9. Disconnessione vocale
+        # 12. Disconnessione vocale
         if re.match(
-            r"^(?:esci(?:\s+dal\s+canale|\s+dalla\s+vocale)?|disconnettiti|vai\s+via)$",
+            r"^(?:(?:esci|uscire)(?:\s+dal\s+canale|\s+dalla\s+vocale)?|disconnettiti|disconnetti|vai\s+via)$",
             lower,
         ):
             return AssistantResponse(
                 action="disconnect",
-                voice_reply="Va bene, mi disconnetto dal canale vocale. A presto!",
+                voice_reply="A presto!",
             )
 
-        # 10. Domande rapide su ora / data
-        if re.match(r"^(?:che\s+ore\s+sono|che\s+ora\s+(?:e|è)|dimmi\s+l'ora)$", lower):
+        # 13. Radio 24/7 (Lofi / Jazz / Synthwave) in locale!
+        if re.match(r"^(?:metti|riproduci|avvia|suona)\s+(?:la\s+)?(?:radio\s+)?lofi\s+jazz$", lower):
+            return AssistantResponse(
+                action="play",
+                query="https://www.youtube.com/watch?v=HuFYqnbVbzY",
+                voice_reply="Avvio la radio Lofi Jazz.",
+            )
+        if re.match(r"^(?:metti|riproduci|avvia|suona)\s+(?:la\s+)?(?:radio\s+)?lofi$", lower):
+            return AssistantResponse(
+                action="play",
+                query="https://www.youtube.com/watch?v=jfKfPfyJRdk",
+                voice_reply="Avvio la radio Lofi.",
+            )
+        if re.match(r"^(?:metti|riproduci|avvia|suona)\s+(?:la\s+)?(?:radio\s+)?synthwave$", lower):
+            return AssistantResponse(
+                action="play",
+                query="https://www.youtube.com/watch?v=4xDzrJKXOOY",
+                voice_reply="Avvio la radio Synthwave.",
+            )
+
+        # 14. Richiesta diretta di riproduzione ("metti / riproduci / suona / ascoltiamo <canzone/artista>")
+        # Processata 100% IN LOCALE in <0.2ms (senza chiamare l'LLM!) a meno che sia una richiesta astratta
+        q_play = self._extract_Explicit_play_query(raw)
+        if q_play and not VAGUE_PLAY_PATTERNS.search(q_play):
+            # Applica eventuali correzioni fonetiche istantanee locali
+            normalized_q = LOCAL_PHONETIC_FIXES.get(q_play.lower().strip(), q_play)
+            return AssistantResponse(
+                action="play",
+                query=normalized_q,
+                voice_reply=f"Riproduco {normalized_q}.",
+            )
+
+        # 15. Domande rapide su ora / data / saluti (100% in locale, 0ms!)
+        if re.match(r"^(?:che\s+ore\s+sono|che\s+ora\s+(?:e|è)|dimmi\s+l'ora|ora\s+esatta)$", lower):
             try:
                 now = datetime.now(ZoneInfo("Europe/Rome"))
             except Exception:
@@ -241,27 +373,66 @@ class AIAssistant:
                 voice_reply=f"Sono le {now.strftime('%H e %M')}.",
             )
 
-        if re.match(r"^(?:che\s+giorno\s+(?:e|è)(?:\s+oggi)?|quanti\s+ne\s+abbiamo(?:\s+oggi)?|che\s+data\s+(?:e|è)(?:\s+oggi)?)$", lower):
+        if re.match(
+            r"^(?:che\s+giorno\s+(?:e|è)(?:\s+oggi)?|quanti\s+ne\s+abbiamo(?:\s+oggi)?|che\s+data\s+(?:e|è)(?:\s+oggi)?)$",
+            lower,
+        ):
             return AssistantResponse(
                 action="none",
                 voice_reply=f"Oggi è {get_italian_datetime_str().split(',')[0]}.",
+            )
+
+        if re.match(r"^(?:ciao|ehi|hey|buongiorno|buonasera|salve)$", lower):
+            return AssistantResponse(
+                action="listen_followup",
+                voice_reply="Ciao! Dimmi pure.",
+            )
+
+        if re.match(r"^(?:come\s+stai|tutto\s+bene|come\s+va)$", lower):
+            return AssistantResponse(
+                action="none",
+                voice_reply="Tutto benissimo, grazie! Pronta a mettere un po' di musica o rispondere alle tue domande.",
+            )
+
+        if re.match(r"^(?:mi\s+senti|ci\s+sei|sei\s+attiva|funzioni)$", lower):
+            return AssistantResponse(
+                action="listen_followup",
+                voice_reply="Sì, ti sento forte e chiaro! Dimmi pure.",
+            )
+
+        if re.match(r"^(?:grazie(?:\s+mille|\s+tante)?|perfetto|ottimo|brava|grande)$", lower):
+            return AssistantResponse(
+                action="none",
+                voice_reply="Di nulla, figurati!",
             )
 
         return None
 
     @staticmethod
     def _extract_Explicit_play_query(text: str) -> Optional[str]:
-        """Se la frase inizia con 'metti/riproduci/suona/play ...', estrae la query grezza per eventuale fallback."""
+        """Estrae la canzone/artista da 'metti/riproduci/suona/play ...' preservando le maiuscole."""
         clean = re.sub(r"[.!?]+$", "", text.strip()).strip()
+        clean = re.sub(
+            r"^(?:per\s+favore|per\s+piacere|cortesemente|mi\s+puoi|puoi|potresti|vorrei\s+che|riesci\s+a)\s+",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        ).strip()
         m_play = re.match(
-            r"^(?:riproduci|metti(?:\s+su)?|suona|fai\s+partire|ascoltiamo|play)\s+(.+)$",
+            r"^(?:riproduci|riprodurre|metti(?:\s+su)?|mettere(?:\s+su)?|suona|suonare|fai\s+partire|ascoltiamo|fammi\s+ascoltare|voglio\s+ascoltare|cerca|play)\s+(.+)$",
             clean,
             flags=re.IGNORECASE,
         )
         if m_play:
             q = m_play.group(1).strip()
             q = re.sub(
-                r"\s+(?:su\s+youtube|su\s+spotify|per\s+favore|per\s+piacere)$",
+                r"^(?:la\s+canzone|il\s+brano|un\s+brano\s+di|una\s+canzone\s+di|qualcosa\s+dei|qualcosa\s+di)\s+",
+                "",
+                q,
+                flags=re.IGNORECASE,
+            ).strip()
+            q = re.sub(
+                r"\s+(?:su\s+youtube|su\s+spotify|per\s+favore|per\s+piacere|grazie(?:\s+mille)?|adesso|ora|subito)$",
                 "",
                 q,
                 flags=re.IGNORECASE,
@@ -313,7 +484,7 @@ class AIAssistant:
 
                     if candidates:
                         self._discovered_groq_models = candidates
-                        logging.info(f"Modelli Groq rilevati: {candidates[:3]}")
+                        logging.info(f"Modelli Groq rilevati (priorità velocità): {candidates[:3]}")
                         return candidates
         except Exception as e:
             logging.debug(f"Impossibile elencare i modelli Groq: {e}")
@@ -331,30 +502,23 @@ class AIAssistant:
         current_song: Optional[str] = None,
         queue_count: int = 0,
     ) -> AssistantResponse:
+        # 1. Prova sempre prima l'esecuzione LOCALE ISTANTANEA (< 0.2ms, zero LLM!)
         fast = self._match_fast_command(user_text)
         if fast is not None:
             return fast
 
         explicit_song_fallback = self._extract_Explicit_play_query(user_text)
 
+        # 2. Chiama l'LLM solo per vere domande aperte o richieste musicali astratte
         system_prompt = (
             "Sei Venus, un assistente vocale intelligente in stile Google Assistant in un canale vocale Discord.\n"
             f"Data e ora attuale in Italia: {get_italian_datetime_str()}.\n"
             f"Utente: {user_name}. Brano attuale: {current_song or 'Nessuno'}. Brani in coda: {queue_count}.\n\n"
-            "REGOLA FONDAMENTALE PER LA MUSICA:\n"
-            "- Se l'utente chiede di mettere/riprodurre/suonare una canzone o un artista (in italiano o in inglese), "
-            "imposta \"action\": \"play\".\n"
-            "- Poiché l'utente parla al microfono con accento italiano, i titoli o gli artisti INGLESI potrebbero essere "
-            "trascritti foneticamente o storpiati (es. 'blanding laits' -> 'The Weeknd - Blinding Lights', "
-            "'smels laik tin spirit' -> 'Nirvana - Smells Like Teen Spirit', 'boemian rapsodi' -> 'Queen - Bohemian Rhapsody', "
-            "'fein' -> 'Travis Scott - FE!N', 'starboi' -> 'The Weeknd - Starboy', 'nam' -> 'Linkin Park - Numb').\n"
-            "- Ricostruisci SEMPRE il vero titolo ufficiale della canzone e l'artista musicale reale nel campo \"query\" "
-            "usando il formato 'Artista - Titolo Canzone'. NON cercare MAI video di YouTuber, gameplay o vlog: solo vere canzoni!\n\n"
             "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido:\n"
             "{\n"
             '  "action": "none" | "play" | "pause" | "resume" | "skip" | "stop" | "replay" | "clear_queue" | "autoplay" | "loop" | "shuffle" | "volume_up" | "volume_down" | "volume_set" | "now_playing" | "disconnect",\n'
             '  "query": "Artista - Titolo Canzone (solo se action è play) oppure numero 1-100 (solo se action è volume_set), altrimenti stringa vuota",\n'
-            '  "voice_reply": "Risposta parlata in italiano naturale e concisa (1-2 frasi brevi), senza asterischi o markdown."\n'
+            '  "voice_reply": "Risposta parlata in italiano naturale e concisa (massimo 1-2 frasi brevi), senza asterischi o markdown."\n'
             "}"
         )
 
@@ -396,71 +560,96 @@ class AIAssistant:
             "Authorization": f"Bearer {self.groq_api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                models = await self._get_groq_candidate_models(session)
-                for model_name in models[:4]:
-                    payload = {
-                        "model": model_name,
-                        "messages": messages,
-                        "temperature": 0.3,
-                        "max_tokens": 350,
-                    }
-                    async with session.post(url, headers=headers, json=payload) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            content = data["choices"][0]["message"].get("content") or ""
-                            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                            if content:
-                                return content
-                        elif resp.status == 404:
-                            if self._discovered_groq_models and model_name in self._discovered_groq_models:
+        session = await self._get_session()
+        candidate_models = await self._get_groq_candidate_models(session)
+
+        for model_name in list(candidate_models):
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 220,
+                "response_format": {"type": "json_object"},
+            }
+            try:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["choices"][0]["message"]["content"]
+
+                    if resp.status in (400, 404):
+                        err_text = await resp.text()
+                        if (
+                            "model_not_found" in err_text
+                            or "decommissioned" in err_text
+                            or "not exist" in err_text
+                        ):
+                            if (
+                                self._discovered_groq_models
+                                and model_name in self._discovered_groq_models
+                            ):
                                 self._discovered_groq_models.remove(model_name)
                             continue
-                        else:
-                            err = await resp.text()
-                            logging.debug(f"Groq modello {model_name} status {resp.status}: {err}")
-        except Exception as e:
-            logging.warning(f"Errore chiamata Groq AI: {e}")
+
+                        payload_plain = {
+                            "model": model_name,
+                            "messages": messages,
+                            "temperature": 0.3,
+                            "max_tokens": 220,
+                        }
+                        async with session.post(
+                            url, headers=headers, json=payload_plain
+                        ) as resp2:
+                            if resp2.status == 200:
+                                data2 = await resp2.json()
+                                return data2["choices"][0]["message"]["content"]
+                        continue
+            except Exception as e:
+                logging.debug(f"Errore chiamata Groq ({model_name}): {e}")
         return None
 
     async def _call_gemini(
         self, system_prompt: str, history: list, user_text: str
     ) -> Optional[str]:
-        for model_name in (self.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        models_to_try = [self.gemini_model, "gemini-2.0-flash", "gemini-1.5-flash"]
+        seen = set()
+
+        contents = []
+        for msg in history:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+        session = await self._get_session()
+        for model_name in models_to_try:
+            if model_name in seen:
+                continue
+            seen.add(model_name)
+
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent?key={self.gemini_api_key}"
             )
-            contents = []
-            for msg in history:
-                role = "user" if msg["role"] == "user" else "model"
-                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-            contents.append({"role": "user", "parts": [{"text": user_text}]})
-
             payload = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": contents,
                 "generationConfig": {
                     "temperature": 0.3,
-                    "maxOutputTokens": 350,
+                    "maxOutputTokens": 220,
                     "responseMimeType": "application/json",
                 },
             }
             try:
-                timeout = aiohttp.ClientTimeout(total=8)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, json=payload) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            candidates = data.get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                if parts:
-                                    return parts[0].get("text")
-                        elif resp.status == 404:
-                            continue
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                return parts[0].get("text")
+                    elif resp.status == 404:
+                        continue
             except Exception as e:
                 logging.debug(f"Errore chiamata Gemini ({model_name}): {e}")
         return None
@@ -474,14 +663,13 @@ class AIAssistant:
             "jsonMode": True,
         }
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, dict) and "choices" in data:
-                            return data["choices"][0]["message"]["content"]
-                        return await resp.text()
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, dict) and "choices" in data:
+                        return data["choices"][0]["message"]["content"]
+                    return await resp.text()
         except Exception as e:
             logging.warning(f"Errore fallback cloud AI: {e}")
         return None

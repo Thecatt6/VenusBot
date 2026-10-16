@@ -214,41 +214,46 @@ class VideoSearcher:
             opts.update(extra_opts)
 
         with YoutubeDL(opts) as ytdlp:
-            info = ytdlp.extract_info(target, download=False)
-            if not info:
+            raw_info = ytdlp.extract_info(target, download=False, process=False)
+            if not raw_info:
                 return None
-            if "entries" in info:
-                entries = [e for e in (info.get("entries") or []) if e]
-                if not entries:
-                    return None
-                video = entries[0]
-            else:
-                video = info
 
-            duration = int(video.get("duration") or 0)
-            is_live = bool(video.get("is_live")) or duration == 0
-            webpage_url = video.get("webpage_url") or video.get("url") or target
-            headers = video.get("http_headers") or {}
+            duration = int(raw_info.get("duration") or 0)
+            is_live = bool(raw_info.get("is_live")) or raw_info.get("live_status") == "is_live"
 
-            # Se è una radio live 24/7 (durata 0 / is_live), usa direttamente lo stream
+            # Se è una radio live 24/7 (is_live o > 25 min), estrai solo lo stream senza scaricare file
             if is_live or duration > 1500:
+                info = ytdlp.process_ie_result(raw_info, download=False)
+                if not info:
+                    return None
+                video = (
+                    [e for e in (info.get("entries") or []) if e][0]
+                    if "entries" in info
+                    else info
+                )
                 stream_url = video.get("url")
                 if not stream_url:
                     return None
                 return {
                     "title": _clean_title(video.get("title", "")),
-                    "duration": 0 if is_live else duration,
+                    "duration": 0 if is_live else int(video.get("duration") or duration),
                     "thumbnail": video.get("thumbnail"),
                     "link": stream_url,
-                    "url": webpage_url,
-                    "http_headers": headers,
+                    "url": video.get("webpage_url") or target,
+                    "http_headers": video.get("http_headers") or {},
                     "is_local_cache": False,
                 }
 
-            # Altrimenti scarica il file audio nella cache locale per evitare errori 403 in FFmpeg
-            dl_info = ytdlp.extract_info(webpage_url, download=True)
-            if dl_info and "entries" in dl_info:
-                dl_info = [e for e in dl_info["entries"] if e][0]
+            # Altrimenti processa e scarica in un UNICO passaggio (0 doppie richieste a YouTube!)
+            dl_info = ytdlp.process_ie_result(raw_info, download=True)
+            if not dl_info:
+                return None
+            if "entries" in dl_info:
+                entries = [e for e in (dl_info.get("entries") or []) if e]
+                if not entries:
+                    return None
+                dl_info = entries[0]
+
             downloaded_path = ytdlp.prepare_filename(dl_info)
             if (
                 downloaded_path
@@ -256,12 +261,12 @@ class VideoSearcher:
                 and Path(downloaded_path).stat().st_size > 1024
             ):
                 return {
-                    "title": _clean_title(video.get("title", "")),
-                    "duration": duration,
-                    "thumbnail": video.get("thumbnail"),
+                    "title": _clean_title(dl_info.get("title", "")),
+                    "duration": int(dl_info.get("duration") or duration),
+                    "thumbnail": dl_info.get("thumbnail"),
                     "link": str(downloaded_path),
-                    "url": webpage_url,
-                    "http_headers": headers,
+                    "url": dl_info.get("webpage_url") or target,
+                    "http_headers": dl_info.get("http_headers") or {},
                     "is_local_cache": True,
                 }
         return None

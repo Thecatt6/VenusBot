@@ -433,7 +433,11 @@ class MusicController:
             except Exception as e:
                 logging.error(f"Errore in speakInVC: {e}")
             finally:
-                if tts_file and tts_file.exists():
+                if (
+                    tts_file
+                    and tts_file.exists()
+                    and not tts_file.name.startswith("cached_")
+                ):
                     try:
                         tts_file.unlink()
                     except Exception:
@@ -661,6 +665,7 @@ class MusicController:
                 voice_client.stop_listening()
             sink = ItalianSpeechSink(on_transcription=on_transcription, language="it-IT")
             voice_client.listen(sink)
+            self.client.loop.create_task(self.tts_engine.prewarm_common_phrases())
             logging.info(f"Ascolto vocale in italiano attivo su: {self.guild.name}")
         except Exception as e:
             logging.exception(f"Errore avvio ascolto vocale: {e}")
@@ -810,8 +815,8 @@ class MusicController:
             return
 
         if action == "skip":
-            await self.speakInVC(voice_reply or "Salto il brano.")
             await self.skipSong()
+            await self.speakInVC(voice_reply or "Salto il brano.")
             return
 
         if action == "stop":
