@@ -103,13 +103,23 @@ async def _check_banned(interaction: discord.Interaction) -> bool:
     return False
 
 
-# Gestione automatica 24/7 Smart Connect quando gli utenti entrano/escono dal canale vocale
+# Gestione automatica 24/7 Smart Connect e pulizia stato vocale del bot
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    musicController = await bot.getGuildMusicController(member.guild)
+
+    # Se è il bot stesso ad aver cambiato stato vocale (es. disconnesso/espulso o spostato)
     if member == bot.user:
+        if before.channel is not None and after.channel is None:
+            logging.info(
+                f"Il bot è stato disconnesso dal canale vocale in {member.guild.name}. Pulizia sessione..."
+            )
+            await musicController.handleBotDisconnectedFromVC()
+        elif after.channel is not None and before.channel != after.channel:
+            musicController.voiceChannel = after.channel
+            await musicController.startVoiceRecording()
         return
 
-    musicController = await bot.getGuildMusicController(member.guild)
     voiceChannel, textChannel = musicController.getVideoAndTextChannel()
     if not voiceChannel or not textChannel:
         return
@@ -400,14 +410,24 @@ async def play(interaction: discord.Interaction, query: str):
                 ephemeral=True,
             )
             return
-        else:
+
+    # Rispondi subito all'interazione per evitare il timeout di 3 secondi di Discord
+    await interaction.response.send_message(
+        f"🔍 Ricerca di **{query}** in corso...", delete_after=6
+    )
+
+    if not musicController.isConnectedToVC():
+        try:
             await musicController.two_four_seven(
                 interaction.user.voice.channel, interaction.channel
             )
+        except Exception as e:
+            logging.error(f"Errore connessione vocale in /play: {e}")
+            await interaction.channel.send(
+                f"❌ Impossibile connettersi al canale vocale: {e}"
+            )
+            return
 
-    await interaction.response.send_message(
-        f"🔍 Ricerca di **{query}** in corso...", delete_after=5
-    )
     await musicController.determineSongSource(interaction.user, query)
 
 
@@ -424,14 +444,16 @@ async def playfile(interaction: discord.Interaction, file: discord.Attachment):
                 ephemeral=True,
             )
             return
-        else:
-            await musicController.two_four_seven(
-                interaction.user.voice.channel, interaction.channel
-            )
 
     await interaction.response.send_message(
         f"📥 Caricamento file audio: **{file.filename}**", delete_after=4
     )
+
+    if not musicController.isConnectedToVC():
+        await musicController.two_four_seven(
+            interaction.user.voice.channel, interaction.channel
+        )
+
     await musicController.handleFile(interaction.user, file)
 
 
@@ -445,16 +467,23 @@ async def two_four_seven(
     if await _check_banned(interaction):
         return
 
+    await interaction.response.defer()
     musicController = await bot.getGuildMusicController(guild=interaction.guild)
-    response = await musicController.two_four_seven(channel, interaction.channel)
-    primary_kw = await BotKeywords().getPrimaryKeyword()
-    if response:
-        await interaction.response.send_message(
-            f"🎧 Il bot è attivo in **{response.channel.name}** (Parola di attivazione: **`{primary_kw}`**)."
-        )
-    else:
-        await interaction.response.send_message(
-            f"✅ Modalità 24/7 e assistente vocale attivati in **{channel.name}** (Parola di attivazione: **`{primary_kw}`**)."
+    try:
+        response = await musicController.two_four_seven(channel, interaction.channel)
+        primary_kw = await BotKeywords().getPrimaryKeyword()
+        if response:
+            await interaction.followup.send(
+                f"🎧 Il bot è già attivo e in ascolto in **{response.channel.name}** (Parola di attivazione: **`{primary_kw}`**)."
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ Modalità 24/7 e assistente vocale attivati in **{channel.name}** (Parola di attivazione: **`{primary_kw}`**)."
+            )
+    except Exception as e:
+        logging.error(f"Errore comando /247: {e}")
+        await interaction.followup.send(
+            f"❌ Errore durante la connessione al canale vocale **{channel.name}**: {e}"
         )
 
 
@@ -470,11 +499,12 @@ async def lofi(interaction: discord.Interaction):
                 "⚠️ Devi essere in un canale vocale.", ephemeral=True
             )
             return
+
+    await interaction.response.send_message("📻 Avvio Radio Lofi...", delete_after=5)
+    if not musicController.isConnectedToVC():
         await musicController.two_four_seven(
             interaction.user.voice.channel, interaction.channel
         )
-
-    await interaction.response.send_message("📻 Avvio Radio Lofi...", delete_after=5)
     await musicController.determineSongSource(
         interaction.user, "https://www.youtube.com/watch?v=jfKfPfyJRdk"
     )
@@ -492,11 +522,12 @@ async def lofijazz(interaction: discord.Interaction):
                 "⚠️ Devi essere in un canale vocale.", ephemeral=True
             )
             return
+
+    await interaction.response.send_message("🎷 Avvio Radio Lofi Jazz...", delete_after=5)
+    if not musicController.isConnectedToVC():
         await musicController.two_four_seven(
             interaction.user.voice.channel, interaction.channel
         )
-
-    await interaction.response.send_message("🎷 Avvio Radio Lofi Jazz...", delete_after=5)
     await musicController.determineSongSource(
         interaction.user, "https://www.youtube.com/watch?v=HuFYqnbVbzY"
     )
@@ -514,11 +545,12 @@ async def synthwave(interaction: discord.Interaction):
                 "⚠️ Devi essere in un canale vocale.", ephemeral=True
             )
             return
+
+    await interaction.response.send_message("🌆 Avvio Radio SynthWave...", delete_after=5)
+    if not musicController.isConnectedToVC():
         await musicController.two_four_seven(
             interaction.user.voice.channel, interaction.channel
         )
-
-    await interaction.response.send_message("🌆 Avvio Radio SynthWave...", delete_after=5)
     await musicController.determineSongSource(
         interaction.user, "https://www.youtube.com/watch?v=4xDzrJKXOOY"
     )

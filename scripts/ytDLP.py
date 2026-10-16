@@ -4,7 +4,7 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 from yt_dlp import YoutubeDL
 
@@ -74,7 +74,7 @@ def _score_music_candidate(entry: dict, original_query: str) -> int:
     duration = int(entry.get("duration") or 0)
     query_lower = original_query.lower()
 
-    # Escludi video troppo corti (< 35s, es. Shorts/Meme) o troppo lunghi (> 12 min, es. Vlog/Gameplay)
+    # Escludi video troppo corti (< 35s, es. Shorts/Preview) o troppo lunghi (> 12 min, es. Vlog/Gameplay)
     if duration > 0 and (duration < 35 or duration > 720):
         return -100
 
@@ -113,6 +113,12 @@ class VideoSearcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_base_options(self) -> dict:
+        """
+        Opzioni base yt-dlp:
+        - Usa i client predefiniti di yt-dlp 2026 ('tv', 'android_sdkless', 'web')
+          evitando 'android_vr' e 'ios' che causano HTTP Error 403 Forbidden.
+        - Forza IPv4 ('source_address': '0.0.0.0') per evitare Read Timeout su Docker.
+        """
         opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "quiet": True,
@@ -120,24 +126,20 @@ class VideoSearcher:
             "cachedir": False,
             "nocheckcertificate": True,
             "geo_bypass": True,
-            "source_address": "0.0.0.0",  # Forza IPv4 per evitare Read Timeout su googlevideo.com in Docker
-            "socket_timeout": 8,
+            "source_address": "0.0.0.0",
+            "socket_timeout": 10,
             "retries": 2,
             "fragment_retries": 2,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android_vr", "ios", "tv", "web"],
-                }
-            },
         }
         if self.cookies_path.exists() and self.cookies_path.stat().st_size > 32:
             opts["cookiefile"] = str(self.cookies_path)
         return opts
 
-    def _select_best_music_url(self, query: str) -> str:
+    def _select_best_music_candidate(self, query: str) -> Tuple[str, str]:
         """
         Cerca su YouTube filtrando esclusivamente brani musicali (Topic, VEVO, Official Audio)
         ed escludendo video di YouTuber, gameplay o vlog.
+        Restituisce (target_url, clean_title_or_query).
         """
         search_query = query
         if not any(
@@ -165,35 +167,40 @@ class VideoSearcher:
                     )
                     best = scored[0]
                     raw_url = best.get("url") or best.get("webpage_url") or best.get("id")
+                    best_title = _clean_title(best.get("title") or query)
                     if raw_url:
                         if not str(raw_url).startswith("http"):
                             raw_url = f"https://www.youtube.com/watch?v={raw_url}"
                         logging.info(
-                            f"[Filtro Musica] Scelto brano: '{best.get('title')}' "
+                            f"[Filtro Musica] Scelto brano: '{best_title}' "
                             f"(canale: {best.get('channel') or best.get('uploader')})"
                         )
-                        return raw_url
+                        return raw_url, best_title
         except Exception as e:
             logging.debug(f"Ricerca selettiva musicale fallback: {e}")
 
-        return f"ytsearch1:{search_query}"
+        return f"ytsearch1:{search_query}", query
 
-    def _download_or_extract(self, target: str, is_search: bool = False) -> Optional[dict]:
+    def _try_download_single(
+        self, target: str, extra_opts: Optional[dict] = None
+    ) -> Optional[dict]:
         """
-        Estrae e scarica rapidamente la traccia audio con IPv4 forzato e client anti-403.
+        Tenta l'estrazione/download da un target (URL o ricerca) con le opzioni specificate.
+        Se il video è una live stream (es. radio /lofi), non scarica il file ma restituisce lo stream HLS.
         """
-        resolved_target = self._select_best_music_url(target) if is_search else target
-
         file_token = uuid.uuid4().hex[:12]
         outtmpl = str(self.cache_dir / f"track_{file_token}.%(ext)s")
 
-        # 1. Estrai metadati rapidi per capire se è una live stream (es. /lofi) o una canzone
-        meta_opts = {
+        opts = {
             **self._get_base_options(),
             "noplaylist": True,
+            "outtmpl": outtmpl,
         }
-        with YoutubeDL(meta_opts) as ytdlp:
-            info = ytdlp.extract_info(resolved_target, download=False)
+        if extra_opts:
+            opts.update(extra_opts)
+
+        with YoutubeDL(opts) as ytdlp:
+            info = ytdlp.extract_info(target, download=False)
             if not info:
                 return None
             if "entries" in info:
@@ -204,46 +211,178 @@ class VideoSearcher:
             else:
                 video = info
 
-        duration = int(video.get("duration") or 0)
-        is_live = bool(video.get("is_live")) or duration == 0
-        webpage_url = video.get("webpage_url") or video.get("url") or resolved_target
-        headers = video.get("http_headers") or {}
+            duration = int(video.get("duration") or 0)
+            is_live = bool(video.get("is_live")) or duration == 0
+            webpage_url = video.get("webpage_url") or video.get("url") or target
+            headers = video.get("http_headers") or {}
 
-        # 2. Se è una canzone standard (non live, <= 20 min), scaricala in locale con IPv4
-        if not is_live and 0 < duration <= 1200:
-            dl_opts = {
-                **self._get_base_options(),
-                "noplaylist": True,
-                "outtmpl": outtmpl,
-            }
-            try:
-                with YoutubeDL(dl_opts) as ytdlp_dl:
-                    dl_info = ytdlp_dl.extract_info(webpage_url, download=True)
-                    if dl_info and "entries" in dl_info:
-                        dl_info = [e for e in dl_info["entries"] if e][0]
-                    downloaded_path = ytdlp_dl.prepare_filename(dl_info)
-                    if downloaded_path and Path(downloaded_path).exists():
-                        return {
-                            "title": _clean_title(video.get("title", "")),
-                            "duration": duration,
-                            "thumbnail": video.get("thumbnail"),
-                            "link": str(downloaded_path),
-                            "url": webpage_url,
-                            "http_headers": headers,
-                            "is_local_cache": True,
-                        }
-            except Exception as e:
-                logging.warning(f"Download rapido fallito ({e}), uso stream diretto...")
+            # Se è una radio live 24/7 (durata 0 / is_live), usa direttamente lo stream
+            if is_live or duration > 1500:
+                stream_url = video.get("url")
+                if not stream_url:
+                    return None
+                return {
+                    "title": _clean_title(video.get("title", "")),
+                    "duration": 0 if is_live else duration,
+                    "thumbnail": video.get("thumbnail"),
+                    "link": stream_url,
+                    "url": webpage_url,
+                    "http_headers": headers,
+                    "is_local_cache": False,
+                }
 
-        return {
-            "title": _clean_title(video.get("title", "")),
-            "duration": duration,
-            "thumbnail": video.get("thumbnail"),
-            "link": video.get("url"),
-            "url": webpage_url,
-            "http_headers": headers,
-            "is_local_cache": False,
+            # Altrimenti scarica il file audio nella cache locale per evitare errori 403 in FFmpeg
+            dl_info = ytdlp.extract_info(webpage_url, download=True)
+            if dl_info and "entries" in dl_info:
+                dl_info = [e for e in dl_info["entries"] if e][0]
+            downloaded_path = ytdlp.prepare_filename(dl_info)
+            if (
+                downloaded_path
+                and Path(downloaded_path).exists()
+                and Path(downloaded_path).stat().st_size > 1024
+            ):
+                return {
+                    "title": _clean_title(video.get("title", "")),
+                    "duration": duration,
+                    "thumbnail": video.get("thumbnail"),
+                    "link": str(downloaded_path),
+                    "url": webpage_url,
+                    "http_headers": headers,
+                    "is_local_cache": True,
+                }
+        return None
+
+    def _download_from_soundcloud(self, search_query: str) -> Optional[dict]:
+        """
+        Fallback automatico su SoundCloud quando YouTube restituisce HTTP 403 Forbidden sull'IP del server.
+        Filtra automaticamente le anteprime di 30 secondi scegliendo solo brani completi.
+        """
+        clean_q = re.sub(
+            r"\b(official\s+audio|official\s+video|lyrics|lyric\s+video|audio\s+ufficiale)\b",
+            "",
+            search_query,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not clean_q:
+            clean_q = search_query
+
+        logging.info(f"[Fallback Anti-403] Ricerca del brano su SoundCloud: '{clean_q}'")
+
+        file_token = uuid.uuid4().hex[:12]
+        outtmpl = str(self.cache_dir / f"track_sc_{file_token}.%(ext)s")
+
+        sc_opts = {
+            **self._get_base_options(),
+            "noplaylist": True,
+            "default_search": "scsearch6",
+            "ignoreerrors": True,
+            "outtmpl": outtmpl,
         }
+        try:
+            with YoutubeDL(sc_opts) as ytdlp:
+                info = ytdlp.extract_info(f"scsearch6:{clean_q}", download=False)
+                entries = [e for e in (info.get("entries") or []) if e] if info else []
+                if not entries:
+                    return None
+
+                # Scegli il primo brano completo (durata >= 45s per evitare le preview Go+ da 30s)
+                chosen = None
+                for entry in entries:
+                    dur = int(entry.get("duration") or 0)
+                    if 45 <= dur <= 720:
+                        chosen = entry
+                        break
+                if not chosen:
+                    chosen = entries[0]
+
+                sc_url = chosen.get("webpage_url") or chosen.get("url")
+                if not sc_url:
+                    return None
+
+                dl_info = ytdlp.extract_info(sc_url, download=True)
+                if dl_info and "entries" in dl_info:
+                    dl_info = [e for e in dl_info["entries"] if e][0]
+                downloaded_path = ytdlp.prepare_filename(dl_info)
+                if (
+                    downloaded_path
+                    and Path(downloaded_path).exists()
+                    and Path(downloaded_path).stat().st_size > 1024
+                ):
+                    title = _clean_title(chosen.get("title") or clean_q)
+                    logging.info(f"[Fallback SoundCloud] Scaricato con successo: '{title}'")
+                    return {
+                        "title": title,
+                        "duration": int(chosen.get("duration") or 0),
+                        "thumbnail": chosen.get("thumbnail"),
+                        "link": str(downloaded_path),
+                        "url": sc_url,
+                        "http_headers": chosen.get("http_headers") or {},
+                        "is_local_cache": True,
+                    }
+        except Exception as e:
+            logging.warning(f"Errore fallback SoundCloud per '{clean_q}': {e}")
+
+        return None
+
+    def _download_or_extract(self, target: str, is_search: bool = False) -> Optional[dict]:
+        """
+        Pipeline di estrazione audio a 3 livelli (100% anti-403):
+        1. YouTube con client predefiniti yt-dlp 2026 ('tv', 'android_sdkless', 'web')
+        2. YouTube con client HLS Safari ('web_safari', 'tv_downgraded') che non richiede GVS PO Token
+        3. Fallback automatico su SoundCloud ('scsearch') se YouTube blocca l'IP con 403
+        """
+        fallback_query = target
+        if is_search:
+            resolved_target, fallback_query = self._select_best_music_candidate(target)
+        else:
+            resolved_target = target
+
+        # Se è già un link SoundCloud, scaricalo direttamente
+        if "soundcloud.com" in resolved_target.lower():
+            try:
+                res = self._try_download_single(resolved_target)
+                if res:
+                    return res
+            except Exception as e:
+                logging.error(f"Errore download SoundCloud: {e}")
+                return None
+
+        # Livello 1: YouTube Client Predefiniti ('tv', 'android_sdkless', 'web')
+        try:
+            res = self._try_download_single(resolved_target)
+            if res:
+                return res
+        except Exception as e1:
+            logging.warning(f"[YouTube Livello 1] Fallito ({e1}), provo client HLS web_safari...")
+
+        # Livello 2: YouTube Client HLS ('web_safari', 'tv_downgraded')
+        try:
+            safari_opts = {
+                "format": "bestaudio/best",
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["web_safari", "tv_downgraded", "android_sdkless"],
+                    }
+                },
+            }
+            res = self._try_download_single(resolved_target, extra_opts=safari_opts)
+            if res:
+                return res
+        except Exception as e2:
+            logging.warning(f"[YouTube Livello 2] Fallito ({e2}), attivo fallback SoundCloud...")
+
+        # Livello 3: Fallback automatico su SoundCloud
+        if not is_search and resolved_target.startswith("http"):
+            # Se l'input era un URL YouTube diretto, prova a recuperarne il titolo per cercarlo su SoundCloud
+            try:
+                with YoutubeDL({**self._get_base_options(), "extract_flat": True}) as ytdlp:
+                    meta = ytdlp.extract_info(resolved_target, download=False)
+                    if meta and meta.get("title"):
+                        fallback_query = meta["title"]
+            except Exception:
+                pass
+
+        return self._download_from_soundcloud(fallback_query)
 
     async def getVideoInfoFromURL(self, video_url: str):
         loop = asyncio.get_running_loop()

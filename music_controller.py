@@ -82,7 +82,9 @@ class MusicController:
 
         self.current_audio_source: Optional[InterruptibleOpusSource] = None
         self._tts_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
         self._active_listener_until: dict[int, float] = {}
+        self._watchdog_task: Optional[asyncio.Task] = None
 
     def _bot_avatar_url(self) -> Optional[str]:
         if self.client.user:
@@ -94,9 +96,102 @@ class MusicController:
             s.cleanup_cache_file()
         self.songQueue.clear()
 
+    def _get_voice_client(self) -> Optional[voice_recv.VoiceRecvClient]:
+        return self.guild.voice_client or discord.utils.get(
+            self.client.voice_clients, guild=self.guild
+        )
+
     def isConnectedToVC(self) -> bool:
-        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-        return bool(voice_client and voice_client.is_connected())
+        """
+        Verifica se il bot è REALMENTE connesso a un canale vocale su Discord.
+        Controlla sia il VoiceClient locale sia lo stato vocale effettivo del membro bot nel server
+        per evitare falsi positivi (zombie voice_client) dopo disconnessioni o crash di rete.
+        """
+        voice_client = self._get_voice_client()
+        if not voice_client or not voice_client.is_connected() or not voice_client.channel:
+            return False
+
+        bot_member = self.guild.me
+        if bot_member is not None:
+            if not bot_member.voice or not bot_member.voice.channel:
+                return False
+
+        return True
+
+    async def _cleanup_stale_voice_client(self) -> None:
+        """
+        Pulisce forzatamente qualsiasi VoiceClient zombie rimasto in memoria
+        quando il bot non è più realmente nel canale vocale.
+        """
+        if self.current_audio_source is not None:
+            try:
+                self.current_audio_source.cancel_interrupt()
+            except Exception:
+                pass
+            self.current_audio_source = None
+
+        voice_client = self._get_voice_client()
+        if voice_client is not None:
+            try:
+                if hasattr(voice_client, "stop_listening") and voice_client.is_listening():
+                    voice_client.stop_listening()
+            except Exception:
+                pass
+            try:
+                if hasattr(voice_client, "stop_playing"):
+                    voice_client.stop_playing()
+            except Exception:
+                pass
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            try:
+                voice_client.cleanup()
+            except Exception:
+                pass
+
+    async def handleBotDisconnectedFromVC(self) -> None:
+        """
+        Chiamato da on_voice_state_update quando il bot stesso viene disconnesso o espulso dal canale vocale.
+        """
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+        self._clear_queue_and_cache()
+        self.isLooping = False
+        await self._cleanup_stale_voice_client()
+
+    def _ensure_watchdog(self) -> None:
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = self.client.loop.create_task(self._voice_watchdog_loop())
+
+    async def _voice_watchdog_loop(self) -> None:
+        """
+        Controlla periodicamente che l'ascolto vocale (ItalianSpeechSink) sia sempre attivo
+        mentre il bot è nel canale vocale, riavviandolo automaticamente se si interrompe.
+        """
+        try:
+            while True:
+                await asyncio.sleep(4.0)
+                if not self.isConnectedToVC():
+                    await self._cleanup_stale_voice_client()
+                    break
+
+                voice_client = self._get_voice_client()
+                if (
+                    voice_client
+                    and hasattr(voice_client, "is_listening")
+                    and not voice_client.is_listening()
+                ):
+                    logging.info(
+                        f"[Watchdog Vocale] Riavvio automatico ascolto vocale su {self.guild.name}..."
+                    )
+                    await self.startVoiceRecording()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.debug(f"Watchdog vocale terminato: {e}")
 
     def getVideoAndTextChannel(self) -> Tuple[Optional[discord.VoiceChannel], Optional[discord.TextChannel]]:
         return self.voiceChannel, self.textChannel
@@ -126,7 +221,7 @@ class MusicController:
 
         if self.songQueue and self.start_time is not None:
             song_duration = self.songQueue[0].duration
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+            voice_client = self._get_voice_client()
             if voice_client and voice_client.is_paused() and self.pause_start is not None:
                 elapsed = int(self.pause_start - self.start_time - self.pause_duration)
             else:
@@ -192,8 +287,8 @@ class MusicController:
                 if not tts_file or not tts_file.exists():
                     return
 
-                voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-                if not voice_client or not voice_client.is_connected():
+                voice_client = self._get_voice_client()
+                if not voice_client or not self.isConnectedToVC():
                     return
 
                 tts_opus = discord.FFmpegOpusAudio(
@@ -226,9 +321,18 @@ class MusicController:
                     if was_paused:
                         voice_client.resume()
 
-                    try:
-                        await asyncio.wait_for(done_event.wait(), timeout=45.0)
-                    except asyncio.TimeoutError:
+                    start_wait = time.monotonic()
+                    while not done_event.is_set() and (time.monotonic() - start_wait) < 20.0:
+                        if not self.isConnectedToVC() or (
+                            not voice_client.is_playing() and not voice_client.is_paused()
+                        ):
+                            break
+                        try:
+                            await asyncio.wait_for(done_event.wait(), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            continue
+
+                    if not done_event.is_set() and self.current_audio_source is not None:
                         self.current_audio_source.cancel_interrupt()
 
                 # Caso 2: Nessuna canzone in riproduzione
@@ -240,13 +344,18 @@ class MusicController:
 
                     if not voice_client.is_playing():
                         voice_client.play(tts_opus, after=_after_standalone_tts)
-                        try:
-                            await asyncio.wait_for(done_event.wait(), timeout=45.0)
-                        except asyncio.TimeoutError:
+                        start_wait = time.monotonic()
+                        while not done_event.is_set() and (time.monotonic() - start_wait) < 20.0:
+                            if not self.isConnectedToVC() or not voice_client.is_playing():
+                                break
+                            try:
+                                await asyncio.wait_for(done_event.wait(), timeout=0.25)
+                            except asyncio.TimeoutError:
+                                continue
+
+                        if not done_event.is_set() and voice_client.is_playing():
                             if hasattr(voice_client, "stop_playing"):
                                 voice_client.stop_playing()
-                            else:
-                                voice_client.stop()
             except Exception as e:
                 logging.error(f"Errore in speakInVC: {e}")
             finally:
@@ -259,7 +368,7 @@ class MusicController:
     async def skipSong(self, message: discord.Message = None):
         if not self.isConnectedToVC():
             return
-        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+        voice_client = self._get_voice_client()
         if not self.isMajorityVote:
             if self.current_audio_source:
                 self.current_audio_source.cancel_interrupt()
@@ -322,7 +431,7 @@ class MusicController:
 
     async def pauseSong(self) -> bool:
         if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+            voice_client = self._get_voice_client()
             if not voice_client.is_paused():
                 voice_client.pause()
                 self.pause_start = int(time.time())
@@ -337,7 +446,7 @@ class MusicController:
 
     async def resumeSong(self):
         if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+            voice_client = self._get_voice_client()
             if voice_client.is_paused():
                 voice_client.resume()
                 if self.pause_start is not None:
@@ -347,7 +456,7 @@ class MusicController:
     async def stopAllSongs(self, message: discord.Message = None):
         if not self.isConnectedToVC():
             return
-        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+        voice_client = self._get_voice_client()
         if not self.isMajorityVote:
             self._clear_queue_and_cache()
             self.isLooping = False
@@ -411,42 +520,57 @@ class MusicController:
                     return
         except asyncio.TimeoutError:
             if self.textChannel:
-                await self.textChannel.send("⌛ Tempo per votare scaduto. La riproduzione continua.")
+                await self.textChannel.send("⌛ Tempo per votare scaduto. Il brano continua.")
 
     async def softDisconnect(self):
-        if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self._clear_queue_and_cache()
-            self.isLooping = False
-            self.current_audio_source = None
-            await voice_client.disconnect(force=False)
-            logging.debug(f"{self.guild.name} MusicController disconnesso (soft).")
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+        self._clear_queue_and_cache()
+        self.isLooping = False
+        await self._cleanup_stale_voice_client()
+        logging.debug(f"{self.guild.name} MusicController disconnesso (soft).")
 
     async def hardDisconnect(self):
-        if self.isConnectedToVC():
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self._clear_queue_and_cache()
-            self.isLooping = False
-            self.current_audio_source = None
-            await voice_client.disconnect(force=True)
-            logging.debug(f"{self.guild.name} MusicController disconnesso (hard).")
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+        self._clear_queue_and_cache()
+        self.isLooping = False
+        self.voiceChannel = None
+        self.textChannel = None
+        await self._cleanup_stale_voice_client()
+        logging.debug(f"{self.guild.name} MusicController disconnesso (hard).")
 
     async def two_four_seven(
         self, voiceChannel: discord.VoiceChannel, textChannel: discord.TextChannel
     ) -> Optional[discord.VoiceClient]:
-        if not self.isConnectedToVC():
-            await voiceChannel.connect(cls=voice_recv.VoiceRecvClient)
+        """
+        Collega o riallinea il bot al canale vocale indicato, pulendo eventuali
+        sessioni zombie e garantendo che l'ascolto vocale sia attivo.
+        Restituisce None se ha effettuato una nuova connessione, oppure il voice_client se era già lì.
+        """
+        async with self._connect_lock:
+            self.voiceChannel = voiceChannel
+            self.textChannel = textChannel
+
+            if self.isConnectedToVC():
+                voice_client = self._get_voice_client()
+                if voice_client and voice_client.channel and voice_client.channel.id == voiceChannel.id:
+                    if not (hasattr(voice_client, "is_listening") and voice_client.is_listening()):
+                        await self.startVoiceRecording()
+                    self._ensure_watchdog()
+                    return voice_client
+
+            # Non connesso o connesso a un altro canale / zombie client: pulisci e riconnetti
+            await self._cleanup_stale_voice_client()
+            await voiceChannel.connect(
+                cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=15.0
+            )
             logging.info(f"Bot connesso al canale vocale: {voiceChannel.name}")
-            self.voiceChannel = voiceChannel
-            self.textChannel = textChannel
             await self.startVoiceRecording()
+            self._ensure_watchdog()
             return None
-        else:
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-            self.voiceChannel = voiceChannel
-            self.textChannel = textChannel
-            await self.startVoiceRecording()
-            return voice_client
 
     async def startVoiceRecording(self):
         """Avvia l'ascolto continuo in italiano nel canale vocale."""
@@ -455,8 +579,8 @@ class MusicController:
                 self.handleTranscribedAudio(user, text), self.client.loop
             )
 
-        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-        if not voice_client:
+        voice_client = self._get_voice_client()
+        if not voice_client or not self.isConnectedToVC():
             return
         try:
             if hasattr(voice_client, "is_listening") and voice_client.is_listening():
@@ -554,15 +678,14 @@ class MusicController:
                 await self.resumeSong()
                 return
 
-            speak_task = asyncio.create_task(
-                self.speakInVC(voice_reply or f"Riproduco {query}.")
-            )
+            # Pronuncia prima la conferma vocale e poi avvia il caricamento/riproduzione
+            # per evitare qualsiasi conflitto sul player audio di Discord
+            await self.speakInVC(voice_reply or f"Riproduco {query}.")
             await self.determineSongSource(user, query)
-            await speak_task
             return
 
         if action == "pause":
-            voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
+            voice_client = self._get_voice_client()
             if voice_client and not voice_client.is_paused():
                 await self.pauseSong()
                 await self.speakInVC("Musica in pausa.")
@@ -886,8 +1009,7 @@ class MusicController:
         """
         Costruisce le opzioni FFmpeg:
         - Se il file è già scaricato in cache locale da yt-dlp, non servono opzioni di rete.
-        - Se è uno stream HTTP (live radio o file remoto), passa User-Agent e Headers di yt-dlp
-          per evitare errori HTTP 403 Forbidden.
+        - Se è uno stream HTTP (live radio o file remoto), passa User-Agent e Headers di yt-dlp.
         """
         if song.is_local_cache and Path(song.link).exists():
             return "-loglevel error"
@@ -958,15 +1080,23 @@ class MusicController:
         def after_playing(error):
             if error:
                 logging.error(f"Errore durante la riproduzione: {error}")
+            interruptible_player.cancel_interrupt()
+            if self.current_audio_source is interruptible_player:
+                self.current_audio_source = None
             if not self.isLooping and self.songQueue:
                 finished_song = self.songQueue.pop(0)
                 finished_song.cleanup_cache_file()
             fut = asyncio.run_coroutine_threadsafe(self.playSong(), self.client.loop)
             fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
 
-        voice_client = discord.utils.get(self.client.voice_clients, guild=self.guild)
-        if not voice_client or not voice_client.is_connected():
+        voice_client = self._get_voice_client()
+        if not voice_client or not self.isConnectedToVC():
+            self.current_audio_source = None
             return
+
+        if voice_client.is_playing():
+            if hasattr(voice_client, "stop_playing"):
+                voice_client.stop_playing()
 
         voice_client.play(interruptible_player, after=after_playing)
 

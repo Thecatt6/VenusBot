@@ -279,21 +279,22 @@ class InterruptibleOpusSource(discord.AudioSource):
     def read(self) -> bytes:
         with self._lock:
             if self._override_source is not None:
-                data = self._override_source.read()
+                try:
+                    data = self._override_source.read()
+                except Exception:
+                    data = b""
                 if data:
                     return data
                 self._finish_override_locked()
 
-            return self.main_source.read()
+            try:
+                return self.main_source.read()
+            except Exception:
+                return b""
 
     def cleanup(self) -> None:
         with self._lock:
-            if self._override_source is not None:
-                try:
-                    self._override_source.cleanup()
-                except Exception:
-                    pass
-                self._override_source = None
+            self._finish_override_locked()
             try:
                 self.main_source.cleanup()
             except Exception:
