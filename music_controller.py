@@ -87,7 +87,9 @@ class MusicController:
         self._tts_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._active_listener_until: dict[int, float] = {}
+        self._active_song_listener_until: dict[int, float] = {}
         self._watchdog_task: Optional[asyncio.Task] = None
+        self._autoplay_prefetch_task: Optional[asyncio.Task] = None
 
     def _bot_avatar_url(self) -> Optional[str]:
         if self.client.user:
@@ -279,7 +281,96 @@ class MusicController:
 
     async def setAutoplay(self) -> bool:
         self.isAutoplay = not self.isAutoplay
+        if self.isAutoplay and self.isConnectedToVC():
+            if len(self.songQueue) == 1:
+                self._trigger_autoplay_prefetch()
+            elif len(self.songQueue) == 0:
+                if not self._last_seed_song and self.guild.me:
+                    self._last_seed_song = ("The Weeknd - Blinding Lights", self.guild.me)
+                self.client.loop.create_task(self.playSong())
         return self.isAutoplay
+
+    def _trigger_autoplay_prefetch(self) -> None:
+        """
+        Pre-carica in background il prossimo brano Autoplay mentre quello attuale sta ancora suonando,
+        così sia a fine brano sia premendo /skip la canzone successiva parte istantaneamente!
+        """
+        if not self.isAutoplay or len(self.songQueue) != 1:
+            return
+        if self._autoplay_prefetch_task and not self._autoplay_prefetch_task.done():
+            return
+        self._autoplay_prefetch_task = self.client.loop.create_task(
+            self._autoplay_prefetch_worker()
+        )
+
+    async def _autoplay_prefetch_worker(self) -> None:
+        try:
+            if not self.isAutoplay or len(self.songQueue) != 1 or not self.isConnectedToVC():
+                return
+            current = self.songQueue[0]
+            if current.duration == 0:  # Non fare autoplay sulle radio live 24/7
+                return
+            next_song = await self._findNextAutoplaySong(current.title, current.user)
+            if next_song and self.isAutoplay and len(self.songQueue) == 1:
+                self.songQueue.append(next_song)
+                logging.info(
+                    f"[Autoplay Pre-caricato] Aggiunto in coda: '{next_song.title}'"
+                )
+        except Exception as e:
+            logging.debug(f"Errore pre-fetch Autoplay: {e}")
+
+    async def _findNextAutoplaySong(
+        self, seed_title: str, seed_user: discord.User
+    ) -> Optional[Song]:
+        """
+        Cerca il prossimo brano Autoplay su 3 livelli (100% affidabile):
+        1. Catalogo Spotify (brani correlati / stesso artista)
+        2. Suggerimento DJ AI (brano simile per stile/artista)
+        3. Ricerca Mix Musicale su YouTube
+        """
+        recent = self._played_history[-25:]
+
+        # Livello 1: Spotify
+        try:
+            related = await self.spotify.getRelatedTrack(seed_title, exclude_titles=recent)
+            if related and related.get("search_query"):
+                logging.info(
+                    f"[Autoplay Spotify] Trovato correlato: '{related['full_title']}'"
+                )
+                song = await self._prepareSearchSong(seed_user, related["search_query"])
+                if song:
+                    return song
+        except Exception as e:
+            logging.debug(f"Autoplay Livello 1 (Spotify) fallito: {e}")
+
+        # Livello 2: DJ AI
+        try:
+            ai_suggestion = await self.ai_assistant.suggest_related_song(
+                seed_title, exclude_titles=recent
+            )
+            if ai_suggestion:
+                logging.info(f"[Autoplay AI DJ] Consigliato: '{ai_suggestion}'")
+                song = await self._prepareSearchSong(seed_user, ai_suggestion)
+                if song:
+                    return song
+        except Exception as e:
+            logging.debug(f"Autoplay Livello 2 (AI DJ) fallito: {e}")
+
+        # Livello 3: YouTube Music Mix
+        try:
+            searcher = VideoSearcher()
+            yt_related = await searcher.getRelatedMusicTrack(
+                seed_title, exclude_titles=recent
+            )
+            if yt_related:
+                logging.info(f"[Autoplay YouTube] Trovato correlato: '{yt_related}'")
+                song = await self._prepareSearchSong(seed_user, yt_related)
+                if song:
+                    return song
+        except Exception as e:
+            logging.debug(f"Autoplay Livello 3 (YouTube) fallito: {e}")
+
+        return None
 
     def setTTSVoice(self, voice_name: str) -> str:
         return self.tts_engine.set_voice(voice_name)
@@ -341,6 +432,71 @@ class MusicController:
                 await self.textChannel.send("❌ Nessun risultato trovato su YouTube.")
             return None
         return result
+
+    async def playActivationChime(self) -> None:
+        """
+        Riproduce immediatamente il suono di attivazione (chime bitonale stile Google Assistant da 0.25s)
+        nel canale vocale non appena viene pronunciata la parola di attivazione.
+        """
+        if not self.isConnectedToVC():
+            return
+
+        async with self._tts_lock:
+            try:
+                chime_file = self.tts_engine.get_activation_chime_path()
+                if not chime_file or not chime_file.exists():
+                    return
+
+                voice_client = self._get_voice_client()
+                if not voice_client or not self.isConnectedToVC():
+                    return
+
+                chime_opus = discord.FFmpegOpusAudio(
+                    str(chime_file),
+                    before_options="-loglevel error",
+                    options='-vn -loglevel error -filter:a "volume=1.10"',
+                )
+
+                done_event = asyncio.Event()
+                loop = self.client.loop
+
+                if (
+                    (voice_client.is_playing() or voice_client.is_paused())
+                    and self.current_audio_source is not None
+                ):
+                    was_paused = voice_client.is_paused()
+
+                    def _on_chime_end(elapsed_sec: float):
+                        if not was_paused:
+                            self.pause_duration += int(round(elapsed_sec))
+                        else:
+                            try:
+                                voice_client.pause()
+                            except Exception:
+                                pass
+                        loop.call_soon_threadsafe(done_event.set)
+
+                    self.current_audio_source.interrupt_with(chime_opus, on_end=_on_chime_end)
+                    if was_paused:
+                        voice_client.resume()
+
+                    try:
+                        await asyncio.wait_for(done_event.wait(), timeout=1.2)
+                    except asyncio.TimeoutError:
+                        if self.current_audio_source is not None:
+                            self.current_audio_source.cancel_interrupt()
+                else:
+                    def _after_standalone_chime(error):
+                        loop.call_soon_threadsafe(done_event.set)
+
+                    if not voice_client.is_playing():
+                        voice_client.play(chime_opus, after=_after_standalone_chime)
+                        try:
+                            await asyncio.wait_for(done_event.wait(), timeout=1.2)
+                        except asyncio.TimeoutError:
+                            pass
+            except Exception as e:
+                logging.debug(f"Errore riproduzione suono attivazione: {e}")
 
     async def speakInVC(self, text: str) -> None:
         """
@@ -693,10 +849,20 @@ class MusicController:
 
         kw_manager = BotKeywords()
         activated, matched_wake, remainder = await kw_manager.extractCommandAfterWakeWord(text)
+        force_song_mode = False
 
-        # Controlla se l'utente è nella finestra di ascolto attivo (8 secondi dopo aver detto solo "Venus")
+        # 1. Controlla se l'utente è nella finestra di ascolto canzone (dopo aver detto "Venus, metti...")
         now_mono = time.monotonic()
-        if not activated and self._active_listener_until.get(user.id, 0.0) > now_mono:
+        if not activated and self._active_song_listener_until.get(user.id, 0.0) > now_mono:
+            activated = True
+            matched_wake = "song_followup"
+            remainder = text.strip()
+            force_song_mode = True
+            self._active_song_listener_until.pop(user.id, None)
+            self._active_listener_until.pop(user.id, None)
+
+        # 2. Controlla se l'utente è nella finestra di ascolto attivo generale (10s dopo aver detto solo "Venus")
+        elif not activated and self._active_listener_until.get(user.id, 0.0) > now_mono:
             activated = True
             matched_wake = "followup"
             remainder = text.strip()
@@ -714,6 +880,9 @@ class MusicController:
             f"[Assistente Attivato da '{matched_wake}'] {user.display_name} -> '{remainder}'"
         )
 
+        # Riproduci SUBITO il suono di attivazione (chime 0.25s) mentre l'assistente elabora in parallelo!
+        chime_task = asyncio.create_task(self.playActivationChime())
+
         current_song_title = self.songQueue[0].title if self.songQueue else None
         queue_count = max(0, len(self.songQueue) - 1)
 
@@ -723,8 +892,10 @@ class MusicController:
             user_text=remainder,
             current_song=current_song_title,
             queue_count=queue_count,
+            force_song_mode=force_song_mode,
         )
 
+        await chime_task
         await self.executeAssistantResponse(user, assistant_resp)
 
     async def executeAssistantResponse(self, user: discord.Member, resp):
@@ -733,8 +904,15 @@ class MusicController:
         voice_reply = resp.voice_reply
 
         if action == "listen_followup":
-            await self.speakInVC(voice_reply or "Dimmi pure.")
-            self._active_listener_until[user.id] = time.monotonic() + 8.0
+            # Il suono di attivazione (chime) ha già suonato! Apri la finestra di ascolto attivo di 10 secondi.
+            if voice_reply:
+                await self.speakInVC(voice_reply)
+            self._active_listener_until[user.id] = time.monotonic() + 10.0
+            return
+
+        if action == "listen_song_followup":
+            await self.speakInVC(voice_reply or "Dimmi il titolo.")
+            self._active_song_listener_until[user.id] = time.monotonic() + 12.0
             return
 
         if action == "none":
@@ -1182,25 +1360,12 @@ class MusicController:
 
     async def playSong(self):
         if not self.songQueue:
-            # Se Autoplay è attivo e abbiamo appena finito un brano, cerca automaticamente un brano correlato su Spotify
+            # Se Autoplay è attivo e la coda è rimasta vuota, cerca subito il prossimo brano correlato (su 3 livelli)
             if self.isAutoplay and self._last_seed_song and self.isConnectedToVC():
                 seed_title, seed_user = self._last_seed_song
-                self._last_seed_song = None
-                try:
-                    related = await self.spotify.getRelatedTrack(
-                        seed_title, exclude_titles=self._played_history[-25:]
-                    )
-                    if related:
-                        logging.info(
-                            f"[Autoplay] Prossimo brano correlato: '{related['full_title']}'"
-                        )
-                        next_song = await self._prepareSearchSong(
-                            seed_user, related["search_query"]
-                        )
-                        if next_song:
-                            self.songQueue.append(next_song)
-                except Exception as e:
-                    logging.debug(f"Errore selezione Autoplay: {e}")
+                next_song = await self._findNextAutoplaySong(seed_title, seed_user)
+                if next_song:
+                    self.songQueue.append(next_song)
 
         if not self.songQueue:
             self.current_audio_source = None
@@ -1221,6 +1386,10 @@ class MusicController:
         self._last_seed_song = (song.title, song.user)
         if song.title not in self._played_history:
             self._played_history.append(song.title)
+
+        # Se Autoplay è attivo ed è l'ultimo brano in coda, pre-carica già il prossimo in background!
+        if self.isAutoplay and len(self.songQueue) == 1:
+            self._trigger_autoplay_prefetch()
 
         if not song.isFile:
             # Se era un file locale che è stato rimosso o uno stream URL scaduto, rigeneralo

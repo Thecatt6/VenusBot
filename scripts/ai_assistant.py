@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -67,11 +67,12 @@ ITALIAN_WORD_NUMBERS = {
     "minimo": 15,
 }
 
-# Correzioni fonetiche istantanee in locale (0ms) per i titoli/artisti inglesi più comuni
+# Correzioni fonetiche istantanee in locale (0ms)
 LOCAL_PHONETIC_FIXES = {
     "blanding laits": "The Weeknd - Blinding Lights",
     "blinding laits": "The Weeknd - Blinding Lights",
     "blanding light": "The Weeknd - Blinding Lights",
+    "biondi light": "The Weeknd - Blinding Lights",
     "starboi": "The Weeknd - Starboy",
     "boemian rapsodi": "Queen - Bohemian Rhapsody",
     "bohemian rapsodi": "Queen - Bohemian Rhapsody",
@@ -87,14 +88,9 @@ LOCAL_PHONETIC_FIXES = {
     "shape of iu": "Ed Sheeran - Shape of You",
     "beliver": "Imagine Dragons - Believer",
     "ander de brig": "Red Hot Chili Peppers - Under the Bridge",
+    "nam": "Linkin Park - Numb",
+    "in de end": "Linkin Park - In the End",
 }
-
-# Pattern che indicano una richiesta discorsiva/vaga ("metti una canzone triste anni 80")
-# che beneficia davvero dell'LLM per scegliere un titolo specifico
-VAGUE_PLAY_PATTERNS = re.compile(
-    r"\b(?:qualcosa\s+di|una\s+canzone\s+(?:triste|allegra|rilassante|romantica|energica|tranquilla|anni\s+\d+)|un\s+brano\s+(?:triste|allegro|rilassante)|consigliami|scegli\s+tu|a\s+caso| a\s+tua\s+scelta)\b",
-    flags=re.IGNORECASE,
-)
 
 PREFERRED_GROQ_CHAT_MODELS = [
     "llama-3.1-8b-instant",
@@ -118,19 +114,28 @@ def get_italian_datetime_str() -> str:
     return f"{weekday} {now.day} {month} {now.year}, ore {now.strftime('%H:%M')}"
 
 
+def split_en_hint(text: str) -> Tuple[str, Optional[str]]:
+    """Separa eventuale [EN_HINT: ...] aggiunto dal doppio riconoscitore vocale it-IT + en-US."""
+    m = re.search(r"\[EN_HINT:\s*(.+?)\]$", text.strip(), flags=re.IGNORECASE)
+    if m:
+        en_hint = m.group(1).strip()
+        it_text = text[: m.start()].strip()
+        return it_text, en_hint
+    return text.strip(), None
+
+
 def _normalize_command_text(text: str) -> str:
     """
     Pulisce il testo rimuovendo formule di cortesia e riempitivi ("per favore", "puoi", "grazie", ecc.)
     per permettere il riconoscimento locale istantaneo in <0.2ms senza passare per l'LLM.
     """
-    s = re.sub(r"[.!?]+$", "", text.strip().lower()).strip()
-    # Rimuovi suffissi di cortesia
+    s, _ = split_en_hint(text)
+    s = re.sub(r"[.!?]+$", "", s.strip().lower()).strip()
     s = re.sub(
         r"\s+(?:per\s+favore|per\s+piacere|per\s+cortesia|cortesemente|grazie(?:\s+mille)?|adesso|ora|subito|un\s+attimo)$",
         "",
         s,
     ).strip()
-    # Rimuovi prefissi di cortesia
     s = re.sub(
         r"^(?:per\s+favore|per\s+piacere|cortesemente|mi\s+puoi|puoi|potresti|vorrei\s+che|riesci\s+a|fai)\s+",
         "",
@@ -160,11 +165,12 @@ class AssistantResponse:
 
 class AIAssistant:
     """
-    Motore ibrido Ultra-Rapido per VenusBot:
-    1. Elaborazione LOCALE ISTANTANEA (< 0.2ms, zero LLM) per TUTTI i comandi musicali,
-       richieste di canzoni, controllo volume, radio, orario, data e saluti.
-    2. Fallback Cloud AI (Groq / Gemini / Pollinations) usato SOLO per vere domande
-       enciclopediche/generali o richieste musicali astratte ("metti qualcosa di rilassante").
+    Motore Ibrido per VenusBot:
+    1. Comandi di controllo (pausa, salta, stop, volume, loop, shuffle, autoplay, replay, ora/data):
+       100% LOCALI in < 0.2ms (zero chiamate di rete!).
+    2. Richieste di riproduzione musicale ("metti <canzone>"):
+       Usa la doppia trascrizione (Italiano + Inglese) e un micro-risolutore fonetico ultra-veloce
+       per identificare con precisione assoluta qualsiasi canzone italiana o inglese.
     """
 
     def __init__(self):
@@ -181,7 +187,7 @@ class AIAssistant:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
             self._http_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=6)
             )
         return self._http_session
 
@@ -190,19 +196,30 @@ class AIAssistant:
 
     def _match_fast_command(self, text: str) -> Optional[AssistantResponse]:
         """
-        Elaborazione 100% LOCALE (< 0.2ms) per tutti i comandi comuni e le richieste musicali dirette,
-        evitando completamente la latenza dell'LLM.
+        Elaborazione 100% LOCALE (< 0.2ms, zero LLM) per tutti i comandi di controllo
+        del player, regolazione volume, radio 24/7, orario, data e saluti.
         """
-        raw = text.strip()
-        lower = _normalize_command_text(raw)
+        it_raw, _ = split_en_hint(text)
+        lower = _normalize_command_text(it_raw)
 
         if not lower:
             return AssistantResponse(
                 action="listen_followup",
-                voice_reply="Dimmi pure.",
+                voice_reply="",
             )
 
-        # 1. Pausa (anche con varianti verbali come "mettere in pausa", "metti in pausa la musica")
+        # Se l'utente ha detto solo "Venus, metti" / "Venus, riproduci" / "Venus, suona" e ha fatto pausa
+        # prima di dire il titolo della canzone, apri la finestra di ascolto dedicata al brano!
+        if re.match(
+            r"^(?:metti(?:\s+su)?|mettere|riproduci|riprodurre|suona|suonare|ascoltiamo|fammi\s+ascoltare|voglio\s+ascoltare|cerca|play)(?:\s+una\s+canzone|\s+un\s+brano|\s+musica)?$",
+            lower,
+        ):
+            return AssistantResponse(
+                action="listen_song_followup",
+                voice_reply="Dimmi il titolo.",
+            )
+
+        # 1. Pausa
         if re.match(
             r"^(?:(?:metti|mettere)\s+in\s+pausa(?:\s+la\s+musica|\s+la\s+canzone|\s+il\s+brano)?|pausa(?:\s+la\s+musica|\s+la\s+canzone)?|pause|ferma\s+un\s+attimo|aspetta(?:\s+un\s+attimo)?)$",
             lower,
@@ -211,7 +228,7 @@ class AIAssistant:
 
         # 2. Riprendi / Resume
         if re.match(
-            r"^(?:(?:riprendi|riprendere)(?:\s+la\s+musica|\s+la\s+riproduzione|\s+la\s+canzone|\s+pure)?|(?:continua|continuare)(?:\s+la\s+musica|\s+ a\s+suonare)?|(?:fai\s+)?ripartire(?:\s+la\s+musica|\s+la\s+canzone)?|(?:togli|togliere)\s+(?:la\s+)?pausa|resume|riproduci|play)$",
+            r"^(?:(?:riprendi|riprendere)(?:\s+la\s+musica|\s+la\s+riproduzione|\s+la\s+canzone|\s+pure)?|(?:continua|continuare)(?:\s+la\s+musica|\s+a\s+suonare)?|(?:fai\s+)?ripartire(?:\s+la\s+musica|\s+la\s+canzone)?|(?:togli|togliere)\s+(?:la\s+)?pausa|resume)$",
             lower,
         ):
             return AssistantResponse(action="resume", voice_reply="Riprendo la musica.")
@@ -277,7 +294,7 @@ class AIAssistant:
                 voice_reply="Ho mescolato la coda di riproduzione.",
             )
 
-        # 10. Volume (supporta sia cifre "50" sia parole italiane "cinquanta", "metà", "massimo")
+        # 10. Volume (cifre o parole italiane)
         m_vol_num = re.search(
             r"^(?:(?:imposta|impostare|metti|mettere|porta|portare|abbassa|alza)\s+(?:il\s+)?)?volume\s+(?:a|al|su)?\s*(\d{1,3})\s*(?:%|percento)?$",
             lower,
@@ -350,19 +367,7 @@ class AIAssistant:
                 voice_reply="Avvio la radio Synthwave.",
             )
 
-        # 14. Richiesta diretta di riproduzione ("metti / riproduci / suona / ascoltiamo <canzone/artista>")
-        # Processata 100% IN LOCALE in <0.2ms (senza chiamare l'LLM!) a meno che sia una richiesta astratta
-        q_play = self._extract_Explicit_play_query(raw)
-        if q_play and not VAGUE_PLAY_PATTERNS.search(q_play):
-            # Applica eventuali correzioni fonetiche istantanee locali
-            normalized_q = LOCAL_PHONETIC_FIXES.get(q_play.lower().strip(), q_play)
-            return AssistantResponse(
-                action="play",
-                query=normalized_q,
-                voice_reply=f"Riproduco {normalized_q}.",
-            )
-
-        # 15. Domande rapide su ora / data / saluti (100% in locale, 0ms!)
+        # 14. Domande rapide su ora / data / saluti (100% in locale, 0ms!)
         if re.match(r"^(?:che\s+ore\s+sono|che\s+ora\s+(?:e|è)|dimmi\s+l'ora|ora\s+esatta)$", lower):
             try:
                 now = datetime.now(ZoneInfo("Europe/Rome"))
@@ -391,19 +396,19 @@ class AIAssistant:
         if re.match(r"^(?:come\s+stai|tutto\s+bene|come\s+va)$", lower):
             return AssistantResponse(
                 action="none",
-                voice_reply="Tutto benissimo, grazie! Pronta a mettere un po' di musica o rispondere alle tue domande.",
+                voice_reply="Tutto benissimo, grazie!",
             )
 
         if re.match(r"^(?:mi\s+senti|ci\s+sei|sei\s+attiva|funzioni)$", lower):
             return AssistantResponse(
                 action="listen_followup",
-                voice_reply="Sì, ti sento forte e chiaro! Dimmi pure.",
+                voice_reply="Sì, ti sento! Dimmi pure.",
             )
 
         if re.match(r"^(?:grazie(?:\s+mille|\s+tante)?|perfetto|ottimo|brava|grande)$", lower):
             return AssistantResponse(
                 action="none",
-                voice_reply="Di nulla, figurati!",
+                voice_reply="Di nulla!",
             )
 
         return None
@@ -411,7 +416,8 @@ class AIAssistant:
     @staticmethod
     def _extract_Explicit_play_query(text: str) -> Optional[str]:
         """Estrae la canzone/artista da 'metti/riproduci/suona/play ...' preservando le maiuscole."""
-        clean = re.sub(r"[.!?]+$", "", text.strip()).strip()
+        it_raw, _ = split_en_hint(text)
+        clean = re.sub(r"[.!?]+$", "", it_raw.strip()).strip()
         clean = re.sub(
             r"^(?:per\s+favore|per\s+piacere|cortesemente|mi\s+puoi|puoi|potresti|vorrei\s+che|riesci\s+a)\s+",
             "",
@@ -438,6 +444,152 @@ class AIAssistant:
                 flags=re.IGNORECASE,
             ).strip()
             return q or None
+        return None
+
+    async def resolve_song_query(self, raw_query: str, en_hint: Optional[str] = None) -> str:
+        """
+        Risolutore fonetico ultra-veloce (~200ms) specifico per i titoli delle canzoni:
+        - Se il titolo è già nel dizionario fonetico locale, risponde in 0ms.
+        - Altrimenti usa una micro-chiamata AI (max_tokens=45, temperature=0.0) combinando
+          sia la trascrizione italiana sia l'eventuale trascrizione inglese (EN_HINT)
+          per ricostruire il vero 'Artista - Titolo Canzone'.
+        """
+        clean_q = raw_query.strip()
+        if not clean_q:
+            return clean_q
+
+        if clean_q.lower() in LOCAL_PHONETIC_FIXES:
+            return LOCAL_PHONETIC_FIXES[clean_q.lower()]
+
+        # Se non ci sono chiavi AI, usa l'hint inglese (se presente) o la query pulita
+        if not self.groq_api_key and not self.gemini_api_key:
+            if en_hint:
+                en_extracted = self._extract_Explicit_play_query(en_hint)
+                if en_extracted:
+                    return en_extracted
+            return clean_q
+
+        hint_line = f"\nTrascrizione fonetica alternativa (en-US): \"{en_hint}\"" if en_hint else ""
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Sei un esperto musicale per un assistente vocale italiano. "
+                    "L'utente ha chiesto al microfono di riprodurre una canzone o un artista, ma lo speech-to-text "
+                    "potrebbe aver trascritto un titolo inglese o italiano con errori fonetici.\n"
+                    "Restituisci SOLO ED ESCLUSIVAMENTE il vero nome nel formato 'Artista - Titolo Canzone' "
+                    "(oppure il nome ufficiale dell'Artista se ha chiesto solo un artista), senza virgolette né spiegazioni.\n"
+                    "Esempi:\n"
+                    "- 'biondi light' -> The Weeknd - Blinding Lights\n"
+                    "- 'smels laik tin spirit' -> Nirvana - Smells Like Teen Spirit\n"
+                    "- 'boemia rapsodia' -> Queen - Bohemian Rhapsody\n"
+                    "- 'nam dei linkin park' -> Linkin Park - Numb\n"
+                    "- 'cenere di lazza' -> Lazza - Cenere\n"
+                    "- 'geolier' -> Geolier"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Trascrizione vocale (it-IT): \"{clean_q}\"{hint_line}",
+            },
+        ]
+
+        try:
+            if self.groq_api_key:
+                session = await self._get_session()
+                models = await self._get_groq_candidate_models(session)
+                if models:
+                    payload = {
+                        "model": models[0],
+                        "messages": prompt_messages,
+                        "temperature": 0.0,
+                        "max_tokens": 40,
+                    }
+                    headers = {
+                        "Authorization": f"Bearer {self.groq_api_key}",
+                        "Content-Type": "application/json",
+                    }
+                    async with session.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=2.2),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            resolved = (
+                                data["choices"][0]["message"]["content"] or ""
+                            ).strip()
+                            resolved = re.sub(r"<think>.*?</think>", "", resolved, flags=re.DOTALL).strip()
+                            resolved = resolved.strip("\"'`.").split("\n")[0].strip()
+                            if resolved and len(resolved) <= 90:
+                                logging.info(
+                                    f"[Risolutore Canzoni AI] '{clean_q}' -> '{resolved}'"
+                                )
+                                return resolved
+        except Exception as e:
+            logging.debug(f"Risolutore rapido canzoni fallback: {e}")
+
+        return clean_q
+
+    async def suggest_related_song(
+        self, seed_title: str, exclude_titles: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """
+        Suggerisce tramite l'AI un brano correlato dello stesso genere/artista per la modalità Autoplay.
+        """
+        if not self.groq_api_key:
+            return None
+        excluded_str = ", ".join((exclude_titles or [])[-15:])
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Sei un DJ radiofonico esperto. Dato un brano appena ascoltato, "
+                    "consiglia UN SOLO brano famoso molto simile per stile, epoca o artista. "
+                    "Rispondi ESCLUSIVAMENTE nel formato 'Artista - Titolo Canzone', senza spiegazioni."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Ultimo brano ascoltato: {seed_title}\n"
+                    f"Brani già ascoltati da EVITARE: {excluded_str or 'Nessuno'}\n"
+                    "Prossimo brano consigliato (Artista - Titolo):"
+                ),
+            },
+        ]
+        try:
+            session = await self._get_session()
+            models = await self._get_groq_candidate_models(session)
+            if models:
+                payload = {
+                    "model": models[0],
+                    "messages": messages,
+                    "temperature": 0.6,
+                    "max_tokens": 35,
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": "application/json",
+                }
+                async with session.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=3.0),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        suggestion = (
+                            data["choices"][0]["message"]["content"] or ""
+                        ).strip()
+                        suggestion = re.sub(r"<think>.*?</think>", "", suggestion, flags=re.DOTALL).strip()
+                        suggestion = suggestion.strip("\"'`.").split("\n")[0].strip()
+                        if suggestion and "-" in suggestion and len(suggestion) <= 85:
+                            return suggestion
+        except Exception as e:
+            logging.debug(f"Errore suggest_related_song AI: {e}")
         return None
 
     async def _get_groq_candidate_models(self, session: aiohttp.ClientSession) -> List[str]:
@@ -501,19 +653,41 @@ class AIAssistant:
         user_text: str,
         current_song: Optional[str] = None,
         queue_count: int = 0,
+        force_song_mode: bool = False,
     ) -> AssistantResponse:
-        # 1. Prova sempre prima l'esecuzione LOCALE ISTANTANEA (< 0.2ms, zero LLM!)
-        fast = self._match_fast_command(user_text)
+        it_text, en_hint = split_en_hint(user_text)
+
+        # 1. Prova sempre prima i comandi di controllo LOCALI ISTANTANEI (< 0.2ms, zero LLM!)
+        fast = self._match_fast_command(it_text)
         if fast is not None:
             return fast
 
-        explicit_song_fallback = self._extract_Explicit_play_query(user_text)
+        # 2. Se l'utente è nella finestra dopo "Venus, metti..." (force_song_mode)
+        # oppure ha pronunciato "metti / riproduci / suona <canzone>", usa il risolutore rapido canzoni!
+        raw_song_query = self._extract_Explicit_play_query(it_text)
+        if not raw_song_query and force_song_mode:
+            raw_song_query = it_text.strip()
 
-        # 2. Chiama l'LLM solo per vere domande aperte o richieste musicali astratte
+        if raw_song_query:
+            resolved_song = await self.resolve_song_query(raw_song_query, en_hint=en_hint)
+            return AssistantResponse(
+                action="play",
+                query=resolved_song,
+                voice_reply=f"Riproduco {resolved_song}.",
+            )
+
+        # 3. Altrimenti usa l'assistente AI completo (per domande generali o se l'utente ha detto
+        # direttamente il titolo di una canzone dopo aver detto solo "Venus")
+        hint_ctx = f" (Trascrizione alternativa inglese: '{en_hint}')" if en_hint else ""
         system_prompt = (
             "Sei Venus, un assistente vocale intelligente in stile Google Assistant in un canale vocale Discord.\n"
             f"Data e ora attuale in Italia: {get_italian_datetime_str()}.\n"
             f"Utente: {user_name}. Brano attuale: {current_song or 'Nessuno'}. Brani in coda: {queue_count}.\n\n"
+            "REGOLE:\n"
+            "- Se l'utente chiede di mettere una canzone o pronuncia il titolo di un brano/artista musicale "
+            "(anche con errori di trascrizione fonetica in italiano o inglese), imposta \"action\": \"play\" e scrivi "
+            "in \"query\" il vero 'Artista - Titolo Canzone'.\n"
+            "- Se è una domanda generale, rispondi in italiano naturale e conciso con \"action\": \"none\".\n\n"
             "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido:\n"
             "{\n"
             '  "action": "none" | "play" | "pause" | "resume" | "skip" | "stop" | "replay" | "clear_queue" | "autoplay" | "loop" | "shuffle" | "volume_up" | "volume_down" | "volume_set" | "now_playing" | "disconnect",\n'
@@ -524,7 +698,7 @@ class AIAssistant:
 
         history = list(self._history[guild_id])
         messages = [{"role": "system", "content": system_prompt}] + history + [
-            {"role": "user", "content": user_text}
+            {"role": "user", "content": f"{it_text}{hint_ctx}"}
         ]
 
         raw_reply = None
@@ -533,21 +707,14 @@ class AIAssistant:
             raw_reply = await self._call_groq(messages)
 
         if not raw_reply and self.gemini_api_key:
-            raw_reply = await self._call_gemini(system_prompt, history, user_text)
+            raw_reply = await self._call_gemini(system_prompt, history, f"{it_text}{hint_ctx}")
 
         if not raw_reply:
             raw_reply = await self._call_free_cloud_fallback(messages)
 
-        if not raw_reply and explicit_song_fallback:
-            return AssistantResponse(
-                action="play",
-                query=explicit_song_fallback,
-                voice_reply=f"Riproduco {explicit_song_fallback}.",
-            )
+        parsed = self._parse_ai_response(raw_reply, None)
 
-        parsed = self._parse_ai_response(raw_reply, explicit_song_fallback)
-
-        self._history[guild_id].append({"role": "user", "content": user_text})
+        self._history[guild_id].append({"role": "user", "content": it_text})
         self._history[guild_id].append(
             {"role": "assistant", "content": parsed.voice_reply}
         )
@@ -686,7 +853,7 @@ class AIAssistant:
                 )
             return AssistantResponse(
                 action="none",
-                voice_reply="Mi dispiace, al momento non riesco a elaborare la risposta.",
+                voice_reply="Mi dispiace, non ho capito bene.",
             )
 
         cleaned = raw_reply.strip()

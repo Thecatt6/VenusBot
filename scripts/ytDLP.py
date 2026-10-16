@@ -422,6 +422,57 @@ class VideoSearcher:
             None, self._download_or_extract, video_query, True, expected_duration
         )
 
+    async def getRelatedMusicTrack(
+        self, seed_title: str, exclude_titles: Optional[list[str]] = None
+    ) -> Optional[str]:
+        """
+        Cerca su YouTube un brano musicale correlato (stesso artista o mix simile)
+        escludendo i brani già ascoltati.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _find_related():
+            exclude_words = set()
+            for t in (exclude_titles or []) + [seed_title]:
+                if not t:
+                    continue
+                tl = t.lower().strip()
+                exclude_words.add(tl)
+                if "-" in tl:
+                    exclude_words.add(tl.split("-", 1)[1].strip())
+
+            artist_part = (
+                seed_title.split("-", 1)[0].strip()
+                if "-" in seed_title
+                else seed_title.strip()
+            )
+            flat_opts = {
+                **self._get_base_options(),
+                "noplaylist": True,
+                "extract_flat": "in_playlist",
+                "default_search": "ytsearch10",
+                "ignoreerrors": True,
+            }
+            try:
+                with YoutubeDL(flat_opts) as ytdlp:
+                    info = ytdlp.extract_info(
+                        f"{artist_part} top songs official audio", download=False
+                    )
+                    entries = [e for e in (info.get("entries") or []) if e] if info else []
+                    for entry in entries:
+                        if _score_music_candidate(entry, artist_part) < 0:
+                            continue
+                        cand_title = _clean_title(entry.get("title") or "")
+                        cand_lower = cand_title.lower()
+                        if any(ex and len(ex) > 3 and ex in cand_lower for ex in exclude_words):
+                            continue
+                        return cand_title
+            except Exception as e:
+                logging.debug(f"Errore getRelatedMusicTrack YouTube: {e}")
+            return None
+
+        return await loop.run_in_executor(None, _find_related)
+
     async def getSearchResults(self, video_query: str):
         loop = asyncio.get_running_loop()
 

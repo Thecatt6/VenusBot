@@ -4,14 +4,16 @@ import audioop
 import hashlib
 import io
 import logging
+import math
 import os
 import re
+import struct
 import tempfile
 import threading
 import time
 import uuid
 import wave
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Set, Tuple
@@ -417,7 +419,11 @@ class ItalianTTSEngine:
         return None
 
     async def prewarm_common_phrases(self) -> None:
-        """Pre-genera in background le risposte vocali più frequenti per risposta istantanea (0ms)."""
+        """Pre-genera in background il suono di attivazione e le risposte vocali più frequenti (0ms)."""
+        try:
+            self.get_activation_chime_path()
+        except Exception:
+            pass
         common = (
             "Dimmi pure.",
             "Musica in pausa.",
@@ -435,6 +441,55 @@ class ItalianTTSEngine:
                 await self.synthesize_to_file(phrase)
             except Exception:
                 pass
+
+    def get_activation_chime_path(self) -> Path:
+        """
+        Genera (e mantiene in cache) un suono di attivazione cristallino stile Google Assistant / Smart Speaker
+        (doppio tono armonico ascendente D5 -> A5 da 0.25s a 48kHz stereo).
+        """
+        chime_path = self.temp_dir / "cached_wake_chime.wav"
+        if chime_path.exists() and chime_path.stat().st_size > 1024:
+            return chime_path
+
+        sample_rate = 48000
+        duration = 0.25
+        total_samples = int(sample_rate * duration)
+        split_sample = int(sample_rate * 0.105)
+
+        frames = bytearray()
+        for i in range(total_samples):
+            t = i / sample_rate
+            if i < split_sample:
+                # Nota 1: Re5 (587.33 Hz) con armonica morbida
+                local_t = i / sample_rate
+                note_dur = split_sample / sample_rate
+                env = math.sin(math.pi * (local_t / note_dur)) ** 0.7
+                val = (
+                    0.78 * math.sin(2.0 * math.pi * 587.33 * t)
+                    + 0.22 * math.sin(2.0 * math.pi * 1174.66 * t)
+                ) * env
+            else:
+                # Nota 2: La5 (880.00 Hz) brillante con decadimento morbido
+                local_t = (i - split_sample) / sample_rate
+                note_dur = (total_samples - split_sample) / sample_rate
+                attack = min(1.0, local_t / 0.010)
+                decay = math.exp(-local_t * 10.5)
+                env = attack * decay
+                val = (
+                    0.80 * math.sin(2.0 * math.pi * 880.00 * t)
+                    + 0.20 * math.sin(2.0 * math.pi * 1760.00 * t)
+                ) * env
+
+            sample_int = max(-32767, min(32767, int(val * 14500)))
+            frames.extend(struct.pack("<hh", sample_int, sample_int))
+
+        with wave.open(str(chime_path), "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(bytes(frames))
+
+        return chime_path
 
 
 class ItalianDiscordAudioSource(sr.AudioSource):
@@ -487,8 +542,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     SAMPLE_RATE = 48_000
     SAMPLE_WIDTH = 2
-    SILENCE_FLUSH_SECONDS = 0.60   # Risposta ultra-reattiva: 0.60s di silenzio a fine frase
-    MAX_PHRASE_SECONDS = 10.0      # Durata massima singola frase
+    SHORT_SILENCE_FLUSH_SECONDS = 0.55  # Per attivazione rapida ("Venus")
+    LONG_SILENCE_FLUSH_SECONDS = 0.88   # Per frasi con titolo canzone ("Venus metti ...")
+    MAX_PHRASE_SECONDS = 10.0           # Durata massima singola frase
     _HTTP_SESSION = requests.Session()
     _GROQ_WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
     _GROQ_WHISPER_DISABLED = False
@@ -507,8 +563,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
         self._lock = threading.Lock()
         self._user_buffers: Dict[int, Dict[str, Any]] = {}
+        self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=12))
         self._recognizer = sr.Recognizer()
-        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="stt-worker")
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-worker")
         self._running = True
         self._flush_thread = threading.Thread(
             target=self._flush_loop, daemon=True, name="italian-speech-flusher"
@@ -534,27 +591,30 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             return
         mono_pcm = audioop.tomono(data.pcm[:aligned_len], self.SAMPLE_WIDTH, 0.5, 0.5)
 
-        # Ignora puro silenzio digitale iniziale
         rms = audioop.rms(mono_pcm, self.SAMPLE_WIDTH)
         now = time.monotonic()
 
         with self._lock:
             entry = self._user_buffers.get(user.id)
             if entry is None:
-                if rms < 100:
+                # Conserva sempre gli ultimi ~240ms di pre-roll per non tagliare mai l'inizio della prima parola
+                self._preroll_buffers[user.id].append(mono_pcm)
+                if rms < 85:
                     return
+                preroll_bytes = b"".join(self._preroll_buffers[user.id])
+                self._preroll_buffers[user.id].clear()
                 entry = {
                     "user": user,
-                    "pcm": bytearray(),
+                    "pcm": bytearray(preroll_bytes),
                     "first_ts": now,
                     "last_ts": now,
                 }
                 self._user_buffers[user.id] = entry
-
-            entry["user"] = user
-            entry["pcm"].extend(mono_pcm)
-            if rms >= 90:
-                entry["last_ts"] = now
+            else:
+                entry["user"] = user
+                entry["pcm"].extend(mono_pcm)
+                if rms >= 80:
+                    entry["last_ts"] = now
 
     def _flush_loop(self) -> None:
         while self._running:
@@ -566,8 +626,16 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 for uid, entry in list(self._user_buffers.items()):
                     silence_elapsed = now - entry["last_ts"]
                     total_elapsed = now - entry["first_ts"]
+                    # Se la frase è breve (< 0.9s, es. solo "Venus"), chiudi a 0.55s per dare subito il beep!
+                    # Se l'utente sta pronunciando una frase più lunga ("Venus metti ..."), attendi 0.88s
+                    # così una breve esitazione prima del titolo della canzone non spezza il comando.
+                    threshold = (
+                        self.SHORT_SILENCE_FLUSH_SECONDS
+                        if total_elapsed < 0.90
+                        else self.LONG_SILENCE_FLUSH_SECONDS
+                    )
                     if (
-                        silence_elapsed >= self.SILENCE_FLUSH_SECONDS
+                        silence_elapsed >= threshold
                         or total_elapsed >= self.MAX_PHRASE_SECONDS
                     ):
                         self._user_buffers.pop(uid, None)
@@ -579,12 +647,26 @@ class ItalianSpeechSink(voice_recv.AudioSink):
     def _process_utterance(self, user: discord.Member, pcm_bytes: bytes) -> None:
         try:
             duration_sec = len(pcm_bytes) / (self.SAMPLE_RATE * self.SAMPLE_WIDTH)
-            if duration_sec < 0.35:
+            if duration_sec < 0.30:
                 return
-            if audioop.rms(pcm_bytes, self.SAMPLE_WIDTH) < 110:
+            rms = audioop.rms(pcm_bytes, self.SAMPLE_WIDTH)
+            if rms < 95:
                 return
 
-            audio = sr.AudioData(pcm_bytes, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
+            # Normalizzazione automatica del guadagno microfono (AGC) se il volume della voce è basso
+            if rms < 2600:
+                gain = min(3.8, 3000.0 / max(rms, 1))
+                try:
+                    pcm_bytes = audioop.mul(pcm_bytes, self.SAMPLE_WIDTH, gain)
+                except Exception:
+                    pass
+
+            # Aggiungi 180ms di silenzio pulito all'inizio e alla fine per migliorare drasticamente
+            # l'accuratezza di Whisper e Google STT sulle parole iniziali e finali
+            pad = b"\x00" * int(self.SAMPLE_RATE * self.SAMPLE_WIDTH * 0.18)
+            framed_pcm = pad + pcm_bytes + pad
+
+            audio = sr.AudioData(framed_pcm, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
             text = self._recognize_italian(self._recognizer, audio)
             if text and text.strip():
                 self.on_transcription(user, text.strip())
@@ -592,19 +674,46 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             logging.debug(f"Errore elaborazione frase vocale: {e}")
 
     def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
-        # 1. Prova Groq Whisper Cloud con prompt bilingue (italiano + titoli musicali in inglese)
+        # 1. Prova Groq Whisper Cloud multilingue (capisce nativamente comandi italiani + titoli inglesi)
         if self.groq_api_key:
             whisper_text = self._recognize_with_groq_whisper(audio)
             if whisper_text:
                 return whisper_text
 
-        # 2. Fallback Google Speech Recognition (it-IT)
+        # 2. Fallback Google Speech Recognition (it-IT + doppia ipotesi en-US per i titoli inglesi)
         try:
             func = getattr(recognizer, "recognize_google", None)
             if func:
-                text = func(audio, language=self.language)
-                if text and isinstance(text, str):
-                    return text.strip()
+                raw_it = func(audio, language=self.language, show_all=True)
+                best_it = None
+                alt_it = []
+                if isinstance(raw_it, dict) and "alternative" in raw_it:
+                    for item in raw_it["alternative"]:
+                        tr = (item.get("transcript") or "").strip()
+                        if tr:
+                            alt_it.append(tr)
+                    if alt_it:
+                        best_it = alt_it[0]
+                elif isinstance(raw_it, str) and raw_it.strip():
+                    best_it = raw_it.strip()
+
+                if best_it:
+                    # Se sembra una richiesta musicale, interroga anche il modello en-US
+                    # per catturare perfettamente eventuali titoli/artisti in inglese!
+                    lower_it = best_it.lower()
+                    if any(
+                        w in lower_it
+                        for w in ("metti", "riproduci", "suona", "play", "cerca", "ascoltiamo", "canzone")
+                    ):
+                        try:
+                            en_text = func(audio, language="en-US")
+                            if en_text and isinstance(en_text, str) and en_text.strip():
+                                en_clean = en_text.strip()
+                                if en_clean.lower() != lower_it:
+                                    return f"{best_it} [EN_HINT: {en_clean}]"
+                        except Exception:
+                            pass
+                    return best_it
         except sr.UnknownValueError:
             pass
         except sr.RequestError as e:
@@ -620,11 +729,14 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
         whisper_models = ItalianSpeechSink._GROQ_WHISPER_MODELS
 
-        # Prompt che guida Whisper a riconoscere comandi italiani + titoli di canzoni in inglese e italiano
+        # Prompt bilingue e SENZA forzare language="it", così Whisper riconosce l'italiano
+        # e mantiene i titoli inglesi ("Blinding Lights", "Numb", "Bohemian Rhapsody") in inglese originale!
         bilingual_prompt = (
-            "Venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume. "
-            "Richieste vocali in italiano e titoli di canzoni o artisti in inglese e italiano "
-            "(es. Blinding Lights, The Weeknd, Bohemian Rhapsody, Queen, Eminem, Travis Scott, Drake, Linkin Park, Geolier, Vasco Rossi)."
+            "Venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume, autoplay. "
+            "Comandi vocali in italiano con titoli di canzoni in italiano o in inglese: "
+            "Venus metti Blinding Lights, The Weeknd, Bohemian Rhapsody, Queen, Eminem, Without Me, "
+            "Travis Scott, FE!N, Linkin Park, Numb, In the End, Imagine Dragons, Believer, Coldplay, "
+            "Geolier, Lazza, Sfera Ebbasta, Marracash, Vasco Rossi, Mahmood, Blanco, Annalisa."
         )
 
         try:
@@ -636,7 +748,6 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
                     data={
                         "model": w_model,
-                        "language": "it",
                         "prompt": bilingual_prompt,
                         "response_format": "json",
                         "temperature": "0.0",
@@ -650,7 +761,8 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                         "sottotitoli creati dalla comunità amara.org",
                         "sottotitoli e revisione a cura di",
                         "grazie per aver guardato",
-                        "venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume.",
+                        "thank you for watching",
+                        "venus, metti, riproduci, suona, pausa, riprendi, salta, stop, volume, autoplay.",
                         "...",
                     }
                     if not text or text.lower() in hallucinations:
