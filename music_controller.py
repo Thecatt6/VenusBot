@@ -797,10 +797,23 @@ class MusicController:
                     return voice_client
 
             # Non connesso o connesso a un altro canale / zombie client: pulisci e riconnetti
-            await self._cleanup_stale_voice_client()
-            await voiceChannel.connect(
-                cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=15.0
-            )
+            for attempt in range(2):
+                await self._cleanup_stale_voice_client()
+                try:
+                    await voiceChannel.connect(
+                        cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=18.0
+                    )
+                    break
+                except (asyncio.TimeoutError, discord.ClientException) as e:
+                    if attempt == 0:
+                        logging.warning(
+                            f"Tentativo 1 connessione vocale fallito ({e}), riprovo tra 1s..."
+                        )
+                        await asyncio.sleep(1.0)
+                    else:
+                        logging.error(f"Impossibile connettersi a {voiceChannel.name}: {e}")
+                        return None
+
             logging.info(f"Bot connesso al canale vocale: {voiceChannel.name}")
             await self.startVoiceRecording()
             self._ensure_watchdog()

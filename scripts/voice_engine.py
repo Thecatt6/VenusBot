@@ -27,6 +27,7 @@ from discord.ext.voice_recv import reader as vr_reader
 from discord.ext.voice_recv import video as vr_video
 from discord.ext.voice_recv import voice_client as vr_vc
 from discord.ext.voice_recv.rtp import SilencePacket
+from dotenv import load_dotenv
 import requests
 import speech_recognition as sr
 
@@ -557,6 +558,11 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         phrase_time_limit: int = 12,
         language: str = "it-IT",
     ):
+        self._lock = threading.Lock()
+        self._user_buffers: Dict[int, Dict[str, Any]] = {}
+        self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._running = False
         super().__init__(None)
         load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
         self.on_transcription = on_transcription
@@ -566,9 +572,6 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip("'\"")
         self.deepgram_api_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip().strip("'\"")
 
-        self._lock = threading.Lock()
-        self._user_buffers: Dict[int, Dict[str, Any]] = {}
-        self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
         self._recognizer = sr.Recognizer()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-worker")
         self._running = True
@@ -963,9 +966,11 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     def cleanup(self) -> None:
         self._running = False
-        with self._lock:
-            self._user_buffers.clear()
+        if hasattr(self, "_lock") and hasattr(self, "_user_buffers"):
+            with self._lock:
+                self._user_buffers.clear()
         try:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            if getattr(self, "_executor", None) is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
