@@ -728,16 +728,19 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 logging.info(f"[STT: Gemini Audio] '{gem_text}'")
                 return gem_text
 
-        # 3. Groq Whisper Large v3 (modello completo a 32 layer) + arricchimento bilingue parallelo per le canzoni
+        # 3. Groq Whisper Large v3 (modello completo a 32 layer) + trascrizione parallela EN/Multilingua (0ms extra!)
         if self.groq_api_key and wav_bytes:
+            en_future = self._executor.submit(self._recognize_google_en, recognizer, audio)
             whisper_it = self._recognize_with_groq_whisper(wav_bytes, language="it")
             if whisper_it:
                 if self._looks_like_music_request(whisper_it):
-                    # Per le richieste di canzoni, esegui anche la trascrizione multilingue/inglese
-                    # così i titoli inglesi ("Blinding Lights", "Bohemian Rhapsody", ecc.) sono perfetti!
-                    en_hint = self._recognize_with_groq_whisper(wav_bytes, language=None)
+                    en_hint = None
+                    try:
+                        en_hint = en_future.result(timeout=0.9)
+                    except Exception:
+                        pass
                     if not en_hint:
-                        en_hint = self._recognize_google_en(recognizer, audio)
+                        en_hint = self._recognize_with_groq_whisper(wav_bytes, language=None)
                     if en_hint and en_hint.lower().strip() != whisper_it.lower().strip():
                         logging.info(
                             f"[STT: Groq Whisper-v3 Dual] IT='{whisper_it}' | EN='{en_hint}'"
