@@ -1,3 +1,7 @@
-[
-  "venus"
-]
+{
+  "primary": "venus",
+  "aliases": [
+    "venere"
+  ],
+  "fuzzy_threshold": 0.78
+}

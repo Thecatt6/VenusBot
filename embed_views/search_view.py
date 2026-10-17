@@ -1,47 +1,63 @@
 import discord
 
+
 class SearchView(discord.ui.View):
     def __init__(self, songs, musicController, bot):
-        super().__init__(timeout=None)
-        self.songs = songs
+        super().__init__(timeout=120)
+        self.songs = songs[:10]
         self.musicController = musicController
         self.bot = bot
 
     async def send_page(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title=f"Search Results:",
-            color=0xa600ff,
+            title="🔍 Risultati della Ricerca:",
+            color=0xA600FF,
         )
-        embed.set_thumbnail(url=self.bot.user.avatar.url)
+        if self.bot.user:
+            embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         for i, song in enumerate(self.songs, start=1):
-            embed.add_field(name=f"{i}", value=song['title'], inline=False)
-        
+            embed.add_field(name=f"{i}.", value=song["title"][:256], inline=False)
+
         class SongDropdown(discord.ui.Select):
-            def __init__(self, parent_view):
+            def __init__(self, parent_view: "SearchView"):
                 self.parent_view = parent_view
                 options = [
-                    discord.SelectOption(label=f"{i+1}. {s['title']}", value=str(i))
+                    discord.SelectOption(
+                        label=f"{i + 1}. {s['title']}"[:100],
+                        value=str(i),
+                    )
                     for i, s in enumerate(parent_view.songs)
                 ]
-                super().__init__(placeholder="Select a song to queue...", options=options)
+                super().__init__(
+                    placeholder="Seleziona un brano da riprodurre/mettere in coda...",
+                    options=options,
+                )
 
-            async def callback(self, interaction: discord.Interaction):
+            async def callback(self, select_interaction: discord.Interaction):
                 index = int(self.values[0])
                 song = self.parent_view.songs[index]
 
-                # check if bot is connected to a voice channel
                 if not self.parent_view.musicController.isConnectedToVC():
-                    # check if user is in a voice channel
-                    if not interaction.user.voice or not interaction.user.voice.channel:
-                        await interaction.response.send_message("You or the Bot must be in a voice channel to use this command.")
+                    if not select_interaction.user.voice or not select_interaction.user.voice.channel:
+                        await select_interaction.response.send_message(
+                            "⚠️ Devi trovarti in un canale vocale per riprodurre un brano.",
+                            ephemeral=True,
+                        )
                         return
                     else:
-                        await self.parent_view.musicController.two_four_seven(interaction.user.voice.channel, interaction.channel)
+                        await self.parent_view.musicController.two_four_seven(
+                            select_interaction.user.voice.channel,
+                            select_interaction.channel,
+                        )
 
-                await interaction.response.send_message(f"Adding **{song['title']}**", delete_after=5)
-                await self.parent_view.musicController.determineSongSource(interaction.user, song['link'])          
+                await select_interaction.response.send_message(
+                    f"🎶 Aggiungo **{song['title']}**...", delete_after=5
+                )
+                await self.parent_view.musicController.determineSongSource(
+                    select_interaction.user, song["link"]
+                )
 
-        dropdown_view = discord.ui.View()
+        dropdown_view = discord.ui.View(timeout=120)
         dropdown_view.add_item(SongDropdown(self))
 
         await interaction.channel.send(embed=embed, view=dropdown_view)

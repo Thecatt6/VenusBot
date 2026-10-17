@@ -196,7 +196,6 @@ cython_debug/
 # Venus bot
 cookies.txt
 bot_log.log
-README.md
 venv/
 __pycache__/
 management/banned_users_list.json
